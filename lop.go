@@ -353,8 +353,15 @@ func ComputeFix(measurements []TDOAMeasurement, initialPos LatLon, propSpeedKmS 
 		maxIter = 20
 	}
 
+	// maxRMSKm is the maximum RMS residual (km) we will accept as a valid fix.
+	// A residual above this means the LOPs don't actually intersect near the
+	// computed point — i.e. the measurements are noise, not real signals.
+	// 200 km is generous (real fixes should be < 50 km with good signals).
+	const maxRMSKm = 200.0
+
 	// Collect valid measurements with known station positions.
 	type obs struct {
+		chainGRI  uint32
 		master    LatLon
 		secondary LatLon
 		rangeDiff float64 // c_prop × TDOA_us × 1e-6 (km)
@@ -369,13 +376,25 @@ func ComputeFix(measurements []TDOAMeasurement, initialPos LatLon, propSpeedKmS 
 			continue
 		}
 		observations = append(observations, obs{
+			chainGRI:  m.ChainGRI,
 			master:    master,
 			secondary: secondary,
 			rangeDiff: propSpeedKmS * m.TDOA_US * 1e-6,
 		})
 	}
 
+	// Require at least 2 observations from at least 2 *distinct* chains.
+	// A single chain can contribute multiple secondaries, but they all share
+	// the same master — so they are not geometrically independent and cannot
+	// constrain a 2-D position fix on their own.
 	if len(observations) < 2 {
+		return PositionFix{Valid: false, UpdatedAt: time.Now()}
+	}
+	distinctChains := make(map[uint32]struct{})
+	for _, ob := range observations {
+		distinctChains[ob.chainGRI] = struct{}{}
+	}
+	if len(distinctChains) < 2 {
 		return PositionFix{Valid: false, UpdatedAt: time.Now()}
 	}
 
@@ -521,6 +540,13 @@ func ComputeFix(measurements []TDOAMeasurement, initialPos LatLon, propSpeedKmS 
 		sumSq += r * r
 	}
 	rms := math.Sqrt(sumSq / float64(len(observations)))
+
+	// Reject fixes whose RMS residual is too large — this means the LOPs
+	// don't actually intersect and the "fix" is just the optimizer wandering
+	// to a local minimum on noise measurements.
+	if rms > maxRMSKm {
+		return PositionFix{Valid: false, UpdatedAt: time.Now()}
+	}
 
 	return PositionFix{
 		Lat:        lat,

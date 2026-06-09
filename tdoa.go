@@ -59,6 +59,17 @@ const (
 	// in the UI so that the backend only uses chains the frontend considers
 	// "heard" (green badge).
 	minMasterSNRdB = 15.0
+
+	// minSecGlobalSNRdB is an additional gate applied to secondary peaks:
+	// the secondary peak power must exceed the *channel-global* noise floor
+	// (from Quality().NoisePwr) by at least this many dB.
+	//
+	// findPeak()'s local-window SNR is unreliable on small windows — even a
+	// flat noise floor produces a "peak" that can score 10–15 dB relative to
+	// the window mean.  Gating against the global noise floor ensures the
+	// secondary is a real above-noise signal, not just the tallest noise spike
+	// in a ±10-bin search window.
+	minSecGlobalSNRdB = 12.0
 )
 
 // ---------------------------------------------------------------------------
@@ -184,7 +195,18 @@ func (e *TDOAEngine) Update() {
 			}
 
 			secBin, secSub, secSNR := findPeak(avg, lo, hi)
-			secValid := masterValid && secSNR >= minSNRdB
+
+			// Gate 1: local-window SNR must be ≥ minSNRdB.
+			// Gate 2: secondary peak power must exceed the channel's global
+			// noise floor by at least minSecGlobalSNRdB.  This prevents a
+			// noise spike in a small search window from being mistaken for a
+			// real secondary signal.
+			var secAboveGlobalNoise bool
+			if qual.NoisePwr > 0 && secBin >= 0 && secBin < len(avg) {
+				globalSNR := float32(10.0 * math.Log10(float64(avg[secBin]/qual.NoisePwr)))
+				secAboveGlobalNoise = globalSNR >= minSecGlobalSNRdB
+			}
+			secValid := masterValid && secSNR >= minSNRdB && secAboveGlobalNoise
 
 			// Measured delay from master to secondary in µs.
 			measuredUS := float64(secBin-masterBin)*usPerBin +
@@ -207,7 +229,6 @@ func (e *TDOAEngine) Update() {
 				UpdatedAt:   now,
 			})
 		}
-		_ = qual // used for future quality gating
 		_ = masterStation
 	}
 
