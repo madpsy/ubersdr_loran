@@ -225,6 +225,7 @@ type client struct {
 	autoReconnect bool
 	running       bool
 	server        *ScopeServer
+	updateHz      int
 }
 
 func (c *client) httpBase() string {
@@ -334,7 +335,7 @@ func (c *client) runOnce() (reconnect bool) {
 	defer dec.close()
 
 	// Create the Loran-C decoder for this connection.
-	loranDec := NewLoranDecoder(float64(iqSampleRate))
+	loranDec := NewLoranDecoder(float64(iqSampleRate), c.updateHz)
 	loranDec.Start()
 
 	// Notify the scope server of the new decoder so the browser can connect.
@@ -466,12 +467,13 @@ func main() {
 		pass      = flag.String("pass", "", "Bypass password (optional)")
 		webPort   = flag.Int("web-port", defaultWebPort, "Port for the Loran-C scope web UI")
 		webStatic = flag.String("web-static", "./static", "Path to static web files directory")
+		updateHz  = flag.Int("update-hz", 10, "Scope update rate in Hz (1=KiwiSDR-compatible, 10=default, max ~25)")
 		noReconn  = flag.Bool("no-reconnect", false, "Disable auto-reconnect on disconnect")
 	)
 	flag.Parse()
 
 	if *rawURL == "" {
-		fmt.Fprintf(os.Stderr, "Usage: ubersdr_loran -url <http://host:port> [-pass <password>] [-web-port <port>] [-web-static <path>] [-no-reconnect]\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: ubersdr_loran -url <http://host:port> [-pass <password>] [-web-port <port>] [-web-static <path>] [-update-hz <hz>] [-no-reconnect]\n\n")
 		fmt.Fprintf(os.Stderr, "  Connects to UberSDR at 100 kHz (Loran-C carrier) using IQ mode (%d Hz sample rate)\n", iqSampleRate)
 		fmt.Fprintf(os.Stderr, "  and serves a Loran-C pulse-envelope scope at http://localhost:%d/\n", defaultWebPort)
 		os.Exit(1)
@@ -495,6 +497,7 @@ func main() {
 		autoReconnect: !*noReconn,
 		running:       true,
 		server:        server,
+		updateHz:      *updateHz,
 	}
 
 	// Handle SIGINT / SIGTERM gracefully.

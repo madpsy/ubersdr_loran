@@ -86,6 +86,11 @@ type LoranDecoder struct {
 	iSrate uint32
 	srate  float64
 
+	// scopeThreshold is the dspSamps value that triggers a scope update.
+	// KiwiSDR uses i_srate (1 Hz). We default to i_srate/10 (10 Hz) for
+	// a more responsive display.
+	scopeThreshold uint32
+
 	// loran_c_ch_t ch[NCH]
 	ch [nch]loranChannel
 
@@ -104,10 +109,21 @@ type LoranDecoder struct {
 
 // NewLoranDecoder creates a decoder for the given IQ sample rate.
 // Mirrors the SET ext_server_init handler in loran_c_msgs().
-func NewLoranDecoder(srate float64) *LoranDecoder {
+// updateHz controls how many times per second the scope is sent to the browser.
+// The KiwiSDR uses 1 Hz; we default to 10 Hz for a more responsive display.
+func NewLoranDecoder(srate float64, updateHz int) *LoranDecoder {
+	if updateHz <= 0 {
+		updateHz = 10
+	}
+	iSrate := uint32(srate)
+	threshold := iSrate / uint32(updateHz)
+	if threshold == 0 {
+		threshold = 1
+	}
 	d := &LoranDecoder{
-		srate:  srate,
-		iSrate: uint32(srate),
+		srate:          srate,
+		iSrate:         iSrate,
+		scopeThreshold: threshold,
 	}
 	// Default averaging parameters (EMA, decay=256) — matches JS defaults.
 	for i := 0; i < nch; i++ {
@@ -287,7 +303,9 @@ func (d *LoranDecoder) ProcessSamples(samples []int16, fn func(ch int, cmd byte,
 			bn := int(math.Floor(math.Mod(sampMinusOffset, c.sampPerGRI)))
 
 			// if (bn == 0 && c->dsp_samps > e->i_srate) { ... }
-			if bn == 0 && c.dspSamps > d.iSrate {
+			// We use scopeThreshold instead of iSrate to allow faster updates
+			// than the KiwiSDR's 1 Hz default (e.g. 10 Hz for a responsive UI).
+			if bn == 0 && c.dspSamps > d.scopeThreshold {
 				// c->dsp_samps = 0;
 				c.dspSamps = 0
 
