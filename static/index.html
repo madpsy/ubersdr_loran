@@ -107,7 +107,7 @@
   }
   .status-err::before { background: var(--err); }
 
-  /* ── Main content area — scope + map side by side ────────── */
+  /* ── Main content area — scope + TDOA table side by side ─── */
   #main-row {
     display: flex;
     gap: 12px;
@@ -136,14 +136,13 @@
     width: 100%;
   }
 
-  /* ── Map card ────────────────────────────────────────────── */
+  /* ── Map card — full width below the main row ────────────── */
   #map-card {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     overflow: hidden;
-    flex: 1 1 45%;
-    min-width: 280px;
+    flex-shrink: 0;
     display: flex;
     flex-direction: column;
   }
@@ -176,8 +175,7 @@
   }
 
   #map-panel {
-    flex: 1;
-    min-height: 300px;
+    height: 380px;
     background: #111118;
   }
 
@@ -213,13 +211,16 @@
   }
   .tx-label::before { display: none; } /* hide the tooltip arrow */
 
-  /* ── TDOA / Quality panel ────────────────────────────────── */
+  /* ── TDOA / Quality panel — side panel in main row ──────── */
   #tdoa-card {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     overflow: hidden;
-    flex-shrink: 0;
+    flex: 1 1 45%;
+    min-width: 280px;
+    display: flex;
+    flex-direction: column;
   }
 
   #tdoa-card-header {
@@ -370,12 +371,11 @@
     #main-row {
       flex-direction: column;
     }
-    #map-card {
+    #tdoa-card {
       flex: none;
-      height: 320px;
     }
     #map-panel {
-      min-height: 0;
+      height: 280px;
     }
   }
 </style>
@@ -402,7 +402,7 @@
   <span id="status" class="status-err">Connecting…</span>
 </header>
 
-<!-- Scope + Map side by side -->
+<!-- Scope + TDOA table side by side -->
 <div id="main-row">
 
   <div id="scope-card">
@@ -411,38 +411,39 @@
     </div>
   </div>
 
-  <div id="map-card">
-    <div id="map-card-header">
-      🗺 Position Map
-      <span id="fix-badge">No fix</span>
+  <!-- TDOA / Quality table -->
+  <div id="tdoa-card">
+    <div id="tdoa-card-header">
+      TDOA Measurements &amp; Signal Quality
     </div>
-    <div id="map-panel"></div>
+    <div id="tdoa-panel">
+      <table id="tdoa-table">
+        <thead>
+          <tr>
+            <th>Chain</th>
+            <th>Master SNR</th>
+            <th>Secondary</th>
+            <th>Sec SNR</th>
+            <th>TDOA µs</th>
+            <th>Valid</th>
+          </tr>
+        </thead>
+        <tbody id="tdoa-tbody">
+          <tr><td colspan="6" class="val-muted" style="padding:12px 10px;text-align:center">Waiting for measurements…</td></tr>
+        </tbody>
+      </table>
+    </div>
   </div>
 
 </div>
 
-<!-- TDOA / Quality table -->
-<div id="tdoa-card">
-  <div id="tdoa-card-header">
-    TDOA Measurements &amp; Signal Quality
+<!-- Map — full width below -->
+<div id="map-card">
+  <div id="map-card-header">
+    🗺 Position Map
+    <span id="fix-badge">No fix</span>
   </div>
-  <div id="tdoa-panel">
-    <table id="tdoa-table">
-      <thead>
-        <tr>
-          <th>Chain</th>
-          <th>Master SNR</th>
-          <th>Secondary</th>
-          <th>Sec SNR</th>
-          <th>TDOA µs</th>
-          <th>Valid</th>
-        </tr>
-      </thead>
-      <tbody id="tdoa-tbody">
-        <tr><td colspan="6" class="val-muted" style="padding:12px 10px;text-align:center">Waiting for measurements…</td></tr>
-      </tbody>
-    </table>
-  </div>
+  <div id="map-panel"></div>
 </div>
 
 <p class="hint">Click a scope row to shift-align that chain's master station pulse</p>
