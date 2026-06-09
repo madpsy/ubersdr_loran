@@ -9,8 +9,10 @@ services:
       UBERSDR_URL: "http://ubersdr:8080"
       # Bypass password (optional)
       # PASS: ""
-      # Web UI port (default: 8095)
-      # WEB_PORT: "8095"
+      # Web UI port (default: 6088)
+      # WEB_PORT: "6088"
+      # Scope update rate in Hz (default: 10, use 1 for KiwiSDR-compatible 1 Hz)
+      # UPDATE_HZ: "10"
     networks:
       - sdr-network
     logging:
