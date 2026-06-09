@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Loran-C Viewer</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: #1a1a1a;
+    color: #e0e0e0;
+    font-family: Verdana, sans-serif;
+    font-size: 13px;
+    padding: 8px;
+  }
+
+  h1 {
+    color: #00ffff;
+    font-size: 16px;
+    margin-bottom: 4px;
+  }
+
+  .subtitle {
+    color: #aaa;
+    font-size: 12px;
+    margin-bottom: 10px;
+  }
+
+  .subtitle a { color: #7af; }
+
+  #status {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 3px;
+    font-size: 11px;
+    margin-bottom: 8px;
+  }
+  .status-ok  { background: #1a4a1a; color: #4f4; }
+  .status-err { background: #4a1a1a; color: #f44; }
+
+  /* Scope canvas container */
+  #scope-container {
+    background: black;
+    width: 100%;
+    height: 200px;
+    position: relative;
+    margin-bottom: 10px;
+    cursor: crosshair;
+  }
+
+  #scope {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%;
+    height: 200px;
+  }
+
+  /* Controls: two columns side by side */
+  .controls-row {
+    display: flex;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .channel-controls {
+    flex: 1;
+    min-width: 240px;
+    background: #222;
+    border: 1px solid #444;
+    border-radius: 4px;
+    padding: 8px 10px;
+  }
+
+  .channel-controls h2 {
+    font-size: 13px;
+    color: #ff6060;
+    margin-bottom: 6px;
+  }
+
+  .ctrl-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 5px;
+  }
+
+  .ctrl-row label {
+    width: 90px;
+    flex-shrink: 0;
+    color: #aaa;
+    font-size: 11px;
+  }
+
+  .ctrl-row input[type=number] {
+    width: 70px;
+    background: #333;
+    border: 1px solid #555;
+    color: #fff;
+    padding: 2px 4px;
+    border-radius: 3px;
+    font-size: 12px;
+  }
+
+  .ctrl-row select {
+    flex: 1;
+    background: #333;
+    border: 1px solid #555;
+    color: #fff;
+    padding: 2px 4px;
+    border-radius: 3px;
+    font-size: 11px;
+  }
+
+  .ctrl-row input[type=range] {
+    flex: 1;
+  }
+
+  .ctrl-row span {
+    font-size: 11px;
+    color: #ccc;
+    min-width: 100px;
+  }
+
+  .hint {
+    margin-top: 8px;
+    color: #666;
+    font-size: 11px;
+  }
+</style>
+</head>
+<body>
+
+<h1>Loran-C Viewer</h1>
+<p class="subtitle">
+  100 kHz pulse-envelope scope &nbsp;|&nbsp;
+  See also <a href="http://df6nm.bplaced.net/LoranView/LoranGrabber.htm" target="_blank">LoranView</a> by DF6NM
+</p>
+
+<span id="status" class="status-err">Connecting…</span>
+
+<!-- Scope canvas -->
+<div id="scope-container">
+  <canvas id="scope" height="200"></canvas>
+</div>
+
+<!-- Per-channel controls -->
+<div class="controls-row">
+
+  <!-- Channel 0 -->
+  <div class="channel-controls">
+    <h2>Channel 0 (cyan)</h2>
+
+    <div class="ctrl-row">
+      <label>GRI</label>
+      <input type="number" id="gri-input-0" min="1" max="9999" step="1"
+             onchange="onGRIInput(0)" onkeydown="if(event.key==='Enter')onGRIInput(0)">
+    </div>
+    <div class="ctrl-row">
+      <label>Chain</label>
+      <select id="gri-select-0" onchange="onGRISelect(0)">
+        <option value="-1">— select —</option>
+      </select>
+    </div>
+    <div class="ctrl-row">
+      <label id="gain-label-0">Gain (auto-scale)</label>
+      <input type="range" id="gain-0" min="0" max="100" value="0"
+             oninput="onGainChange(0)">
+    </div>
+    <div class="ctrl-row">
+      <label>Averaging</label>
+      <select id="avg-algo-0" onchange="onAvgAlgoChange(0)">
+        <option value="0">CMA</option>
+        <option value="1" selected>EMA</option>
+        <option value="2">IIR</option>
+      </select>
+    </div>
+    <div class="ctrl-row">
+      <span id="avg-param-label-0">Decay 256</span>
+      <input type="range" id="avg-param-0" min="0" max="100" value="50"
+             oninput="onAvgParamChange(0)">
+    </div>
+  </div>
+
+  <!-- Channel 1 -->
+  <div class="channel-controls">
+    <h2>Channel 1 (violet)</h2>
+
+    <div class="ctrl-row">
+      <label>GRI</label>
+      <input type="number" id="gri-input-1" min="1" max="9999" step="1"
+             onchange="onGRIInput(1)" onkeydown="if(event.key==='Enter')onGRIInput(1)">
+    </div>
+    <div class="ctrl-row">
+      <label>Chain</label>
+      <select id="gri-select-1" onchange="onGRISelect(1)">
+        <option value="-1">— select —</option>
+      </select>
+    </div>
+    <div class="ctrl-row">
+      <label id="gain-label-1">Gain (auto-scale)</label>
+      <input type="range" id="gain-1" min="0" max="100" value="0"
+             oninput="onGainChange(1)">
+    </div>
+    <div class="ctrl-row">
+      <label>Averaging</label>
+      <select id="avg-algo-1" onchange="onAvgAlgoChange(1)">
+        <option value="0">CMA</option>
+        <option value="1" selected>EMA</option>
+        <option value="2">IIR</option>
+      </select>
+    </div>
+    <div class="ctrl-row">
+      <span id="avg-param-label-1">Decay 256</span>
+      <input type="range" id="avg-param-1" min="0" max="100" value="50"
+             oninput="onAvgParamChange(1)">
+    </div>
+  </div>
+
+</div>
+
+<p class="hint">
+  Click on the scope to shift-align the master station pulse to that position.
+</p>
+
+<script src="loran_c.js"></script>
+</body>
+</html>

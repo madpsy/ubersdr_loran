@@ -1,0 +1,16 @@
+# Built binary
+ubersdr_loran
+
+# Go build cache
+*.test
+*.out
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

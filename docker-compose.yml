@@ -1,0 +1,26 @@
+services:
+  loran:
+    container_name: loran
+    image: madpsy/ubersdr_loran:latest
+    restart: unless-stopped
+    cpu_shares: 256
+    environment:
+      # UberSDR base URL (required)
+      UBERSDR_URL: "http://ubersdr:8080"
+      # Bypass password (optional)
+      # PASS: ""
+      # Web UI port (default: 8095)
+      # WEB_PORT: "8095"
+    networks:
+      - sdr-network
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: "127.0.0.1:24224"
+        fluentd-async: "true"
+        tag: "loran"
+
+networks:
+  sdr-network:
+    external: true
+    name: ubersdr_sdr-network
