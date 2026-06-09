@@ -194,6 +194,11 @@ type pcmDecoder struct {
 	lastRate     int
 	lastChannels int
 	lastWallMs   uint64 // wall-clock ms from the most recent full header
+	// RTP anchor: used to advance the wall clock on minimal-header packets.
+	// The RTP timestamp is a GPS-disciplined sample counter; we compute
+	//   currentWallMs = anchorWallMs + (rtpNow - anchorRTP) * 1000 / sampleRate
+	anchorRTP    uint64 // RTP sample count at the last full header
+	anchorWallMs uint64 // wall-clock ms at the last full header
 }
 
 func newPCMDecoder() (*pcmDecoder, error) {
@@ -239,6 +244,7 @@ func (d *pcmDecoder) decode(data []byte, isZstd bool) ([]byte, int, int, uint64,
 		if len(data) < headerLen {
 			return nil, 0, 0, 0, fmt.Errorf("full-header packet too short (%d < %d)", len(data), headerLen)
 		}
+		rtpFull := binary.LittleEndian.Uint64(data[4:12])
 		wallMs = binary.LittleEndian.Uint64(data[12:20])
 		rate = int(binary.LittleEndian.Uint32(data[20:24]))
 		ch = int(data[24])
@@ -246,6 +252,9 @@ func (d *pcmDecoder) decode(data []byte, isZstd bool) ([]byte, int, int, uint64,
 		d.lastRate = rate
 		d.lastChannels = ch
 		d.lastWallMs = wallMs
+		// Anchor the RTP counter so minimal-header packets can advance the clock.
+		d.anchorRTP = rtpFull
+		d.anchorWallMs = wallMs
 
 	case magicMinimal:
 		if len(data) < 13 {
@@ -254,10 +263,19 @@ func (d *pcmDecoder) decode(data []byte, isZstd bool) ([]byte, int, int, uint64,
 		raw = data[13:]
 		rate = d.lastRate
 		ch = d.lastChannels
-		wallMs = d.lastWallMs
 		if rate == 0 || ch == 0 {
 			return nil, 0, 0, 0, fmt.Errorf("minimal header received before full header")
 		}
+		// Advance wall clock using the RTP sample counter.
+		// rtpNow is the GPS-disciplined sample count; elapsed = (rtpNow - anchorRTP) samples.
+		rtpNow := binary.LittleEndian.Uint64(data[3:11])
+		if d.anchorWallMs > 0 && rtpNow >= d.anchorRTP {
+			elapsed := rtpNow - d.anchorRTP
+			wallMs = d.anchorWallMs + elapsed*1000/uint64(rate)
+		} else {
+			wallMs = d.lastWallMs
+		}
+		d.lastWallMs = wallMs
 
 	default:
 		return nil, 0, 0, 0, fmt.Errorf("unknown magic 0x%04X", magic)
