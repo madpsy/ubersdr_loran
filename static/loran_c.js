@@ -8,8 +8,15 @@
 // Binary frames:  "DAT" + cmd(1) + ch(1) + scope_bytes(nbucket)
 // Text frames:    JSON { type, ... }
 // Control frames: JSON sent to server
+//
+// Proxy-aware: uses window.BASE_PATH (injected by index.html template) to
+// prefix the WebSocket URL so it works behind /addon/loran/ as well as directly.
 
 'use strict';
+
+// BASE_PATH is set by the index.html template from the X-Forwarded-Prefix header.
+// e.g. "/addon/loran" when behind the UberSDR proxy, "" when accessed directly.
+const BASE_PATH = (typeof window.BASE_PATH === 'string') ? window.BASE_PATH : '';
 
 // ---------------------------------------------------------------------------
 // GRI chain table (mirrors gri_s / gri_2s / emission_delay in Loran_C.js)
@@ -82,7 +89,7 @@ const ch = [
 
 function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const wsUrl = `${proto}://${location.host}/ws`;
+    const wsUrl = `${proto}://${location.host}${BASE_PATH}/ws`;
     ws = new WebSocket(wsUrl);
     ws.binaryType = 'arraybuffer';
 

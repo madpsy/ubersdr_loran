@@ -4,6 +4,11 @@
 //   - Streams binary SCOPE_DATA / SCOPE_RESET frames to connected browsers
 //   - Accepts JSON control messages (gri, gain, offset, avg_algo, avg_param)
 //     and forwards them to the active LoranDecoder
+//
+// Proxy-aware: reads X-Forwarded-Prefix header (set by the UberSDR addon proxy)
+// and injects it as BasePath into the index.html template so that all asset
+// URLs and the WebSocket URL are correctly prefixed when served behind
+// /addon/loran/.
 
 package main
 
@@ -12,7 +17,9 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
+	"text/template"
 
 	"github.com/gorilla/websocket"
 )
@@ -35,6 +42,11 @@ var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+// indexData is passed to the index.html template.
+type indexData struct {
+	BasePath string // e.g. "/addon/loran" or "" when accessed directly
+}
+
 // scopeClient represents one connected browser WebSocket.
 type scopeClient struct {
 	conn *websocket.Conn
@@ -50,6 +62,7 @@ type scopeClient struct {
 // active LoranDecoder instance.
 type ScopeServer struct {
 	staticDir string
+	indexTmpl *template.Template
 
 	clientsMu sync.RWMutex
 	clients   map[*scopeClient]struct{}
@@ -61,15 +74,44 @@ type ScopeServer struct {
 }
 
 // NewScopeServer creates a new ScopeServer serving static files from staticDir.
+// index.html is parsed as a Go template so that {{.BasePath}} is substituted
+// with the X-Forwarded-Prefix header value at request time.
 func NewScopeServer(staticDir string) *ScopeServer {
+	tmpl, err := template.ParseFiles(staticDir + "/index.html")
+	if err != nil {
+		log.Fatalf("failed to parse index.html template: %v", err)
+	}
+
 	s := &ScopeServer{
 		staticDir: staticDir,
+		indexTmpl: tmpl,
 		clients:   make(map[*scopeClient]struct{}),
 	}
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("/ws", s.handleWS)
-	s.mux.Handle("/", http.FileServer(http.Dir(staticDir)))
+	s.mux.HandleFunc("/", s.handleHTTP)
 	return s
+}
+
+// basePath extracts the X-Forwarded-Prefix header value, stripping any
+// trailing slash.  Returns "" when accessed directly (not via proxy).
+func basePath(r *http.Request) string {
+	bp := r.Header.Get("X-Forwarded-Prefix")
+	return strings.TrimRight(bp, "/")
+}
+
+// handleHTTP serves index.html as a template for /, and static files for
+// everything else (loran_c.js, style.css, etc.).
+func (s *ScopeServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/" || r.URL.Path == "/index.html" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if err := s.indexTmpl.Execute(w, indexData{BasePath: basePath(r)}); err != nil {
+			log.Printf("template execute error: %v", err)
+		}
+		return
+	}
+	// All other paths: serve from staticDir as plain files.
+	http.FileServer(http.Dir(s.staticDir)).ServeHTTP(w, r)
 }
 
 // Mux returns the HTTP mux for use with http.ListenAndServe.
