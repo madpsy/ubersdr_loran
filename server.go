@@ -302,18 +302,6 @@ func (s *ScopeServer) buildPushFrames() [][]byte {
 		}
 	}
 
-	// timing_update
-	info := s.GetTimingInfo()
-	if info.Valid {
-		if b, err := json.Marshal(map[string]interface{}{
-			"type":  "timing_update",
-			"valid": info.Valid,
-			"utc":   info.UTC,
-		}); err == nil {
-			frames = append(frames, b)
-		}
-	}
-
 	return frames
 }
 

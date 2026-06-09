@@ -98,43 +98,6 @@ function rowBottom(i) { return (i + 1) * ROW_HEIGHT - H_LEGEND; }
 function scopeH()     { return ROW_HEIGHT - H_LEGEND; }
 
 // ---------------------------------------------------------------------------
-// UTC clock — driven by timing_update WS messages from the server.
-// Between WS pushes the display is advanced by a local JS timer so it ticks
-// smoothly every 100 ms without any REST polling.
-// ---------------------------------------------------------------------------
-
-let utcOffsetMs = 0;      // difference: server UTC ms - Date.now() at last push
-let utcValid    = false;  // true once first timing_update arrives
-let utcTicker   = null;   // setInterval handle for the display tick
-
-function applyTimingUpdate(data) {
-    if (!data.valid) return;
-    // data.utc is RFC3339, e.g. "2026-06-09T11:45:00.123Z"
-    const serverMs = new Date(data.utc).getTime();
-    utcOffsetMs = serverMs - Date.now();
-    utcValid    = true;
-    updateUtcDisplay();
-}
-
-function updateUtcDisplay() {
-    const el = document.getElementById('utc-time');
-    if (!el) return;
-    if (!utcValid) { el.textContent = '--:--:--.---'; return; }
-    const now = new Date(Date.now() + utcOffsetMs);
-    const hh  = String(now.getUTCHours()).padStart(2, '0');
-    const mm  = String(now.getUTCMinutes()).padStart(2, '0');
-    const ss  = String(now.getUTCSeconds()).padStart(2, '0');
-    const ms  = String(now.getUTCMilliseconds()).padStart(3, '0');
-    el.textContent = `${hh}:${mm}:${ss}.${ms}`;
-}
-
-function startUtcClock() {
-    // Tick the display every 100 ms for smooth millisecond updates.
-    // Actual time sync comes from timing_update WS messages.
-    utcTicker = setInterval(updateUtcDisplay, 100);
-}
-
-// ---------------------------------------------------------------------------
 // "Heard only" filter — driven by #valid-only checkbox
 // ---------------------------------------------------------------------------
 
@@ -143,17 +106,33 @@ function heardOnly() {
     return cb ? cb.checked : false;
 }
 
-// Returns true if channel chIdx has a master SNR above the warning threshold
-// (i.e. we can actually hear it).
+// Returns true if channel chIdx has a master SNR above the good threshold
+// (i.e. we can clearly hear it).
 function isChannelHeard(chIdx) {
     const q = channelQuality[chIdx];
     if (!q || q.snr_db === undefined) return false;
-    return q.snr_db >= SNR_WARN;
+    return q.snr_db >= SNR_GOOD;
 }
 
-// Re-draw all legends (called when checkbox toggles)
+// Overlay a translucent dark rectangle over the entire row (legend + trace)
+// when the "heard only" filter is active and this channel is below threshold.
+// Must be called AFTER drawScope() and drawPeakMarkers() so it sits on top.
+function applyRowDimOverlay(chIdx) {
+    if (!canvas) return;
+    if (heardOnly() && !isChannelHeard(chIdx)) {
+        ctx.fillStyle = '#08080c';
+        ctx.globalAlpha = 0.72;
+        ctx.fillRect(0, rowTop(chIdx), scopeWidth, ROW_HEIGHT);
+        ctx.globalAlpha = 1.0;
+    }
+}
+
+// Re-draw all legends and re-apply dim overlays (called when checkbox toggles)
 function redrawAllLegends() {
-    for (let i = 0; i < NCH; i++) drawLegend(i);
+    for (let i = 0; i < NCH; i++) {
+        drawLegend(i);
+        applyRowDimOverlay(i);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -190,9 +169,6 @@ async function bootstrap() {
         }
 
         connect();
-
-        // Start UTC clock display (ticks locally; synced via timing_update WS push)
-        startUtcClock();
 
         // Initialise sibling modules after chains are available
         if (typeof window.mapInit === 'function') {
@@ -266,10 +242,6 @@ function handleJsonMessage(msg) {
             for (let i = 0; i < NCH; i++) drawLegend(i);
             break;
 
-        case 'timing_update':
-            applyTimingUpdate(msg);
-            break;
-
         case 'quality_update': {
             // Server may push {channels: [...]} or {quality: [...]}
             const qArr = msg.channels || msg.quality;
@@ -330,6 +302,8 @@ function handleBinary(buf) {
     drawScope(chIdx, cmd, data);
     // Redraw peak markers on top of fresh trace
     drawPeakMarkers(chIdx);
+    // Apply dim overlay last so it covers both trace and peak markers
+    applyRowDimOverlay(chIdx);
 }
 
 // ---------------------------------------------------------------------------

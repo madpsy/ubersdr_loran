@@ -89,13 +89,17 @@ function applyHeardFilter() {
             const marker = txMarkers[key];
             if (!marker) return;
             if (filter && !heard) {
-                marker.setStyle({ opacity: 0.15, fillOpacity: 0.08 });
+                marker.setStyle({ opacity: 0.12, fillOpacity: 0.06 });
+                // Hide the permanent tooltip so it doesn't float over a ghost marker
+                marker.closeTooltip();
             } else {
                 const isMaster = stIdx === 0;
                 marker.setStyle({
                     opacity:     1,
                     fillOpacity: isMaster ? 0.9 : 0.55,
                 });
+                // Restore the permanent tooltip
+                marker.openTooltip();
             }
         });
     });
@@ -399,9 +403,9 @@ function updateLOPs(lops, chains, traceColors) {
 
 function updateFix(fix) {
     if (!map || !fix || !fix.valid) {
-        // Hide fix marker if invalid
+        // Hide fix marker if invalid — circleMarker has no setOpacity(), use setStyle()
         if (fixMarker) {
-            fixMarker.setOpacity(0.3);
+            fixMarker.setStyle({ opacity: 0.3, fillOpacity: 0.1 });
             if (fixCircle) fixCircle.setStyle({ opacity: 0.1, fillOpacity: 0.05 });
         }
         hideErrorLine();
@@ -420,7 +424,7 @@ function updateFix(fix) {
 
     if (fixMarker) {
         fixMarker.setLatLng([lat, lon]);
-        fixMarker.setOpacity(1);
+        fixMarker.setStyle({ opacity: 1, fillOpacity: 0.9 });
         if (fixCircle) {
             fixCircle.setLatLng([lat, lon]);
             fixCircle.setStyle({ opacity: 0.6, fillOpacity: 0.15 });

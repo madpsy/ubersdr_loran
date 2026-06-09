@@ -71,36 +71,6 @@
     margin-top: 1px;
   }
 
-  /* ── UTC clock ───────────────────────────────────────────── */
-  #utc-clock {
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 1px;
-    padding: 4px 10px;
-    border-radius: var(--radius);
-    background: #0d1a1f;
-    border: 1px solid #00d4ff22;
-    cursor: default;
-  }
-
-  #utc-time {
-    font-size: 15px;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-    letter-spacing: 0.04em;
-    color: var(--accent);
-    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
-  }
-
-  #utc-label {
-    font-size: 9px;
-    font-weight: 600;
-    letter-spacing: 0.12em;
-    color: var(--muted);
-    text-transform: uppercase;
-  }
-
   /* ── Status pill ─────────────────────────────────────────── */
   #status {
     margin-left: auto;
@@ -260,9 +230,6 @@
     color: var(--muted);
     letter-spacing: 0.06em;
     text-transform: uppercase;
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
   }
 
   #valid-only-label {
@@ -378,10 +345,9 @@
     <h1>Loran-C Viewer</h1>
     <p>100 kHz pulse-envelope scope — 14 chains simultaneously</p>
   </div>
-  <div id="utc-clock" title="UTC time from PCM wall-clock (NTP ±1–10 ms)">
-    <span id="utc-time">--:--:--.---</span>
-    <span id="utc-label">UTC</span>
-  </div>
+  <label id="valid-only-label" title="Show only stations we can hear (SNR ≥ 15 dB)">
+    <input type="checkbox" id="valid-only"> Heard only
+  </label>
   <span id="status" class="status-err">Connecting…</span>
 </header>
 
@@ -408,9 +374,6 @@
 <div id="tdoa-card">
   <div id="tdoa-card-header">
     TDOA Measurements &amp; Signal Quality
-    <label id="valid-only-label" title="Hide chains/stations below SNR threshold">
-      <input type="checkbox" id="valid-only"> Heard only
-    </label>
   </div>
   <div id="tdoa-panel">
     <table id="tdoa-table">
