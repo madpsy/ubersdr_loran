@@ -257,6 +257,105 @@ func (d *LoranDecoder) MsPerBin() float64 {
 }
 
 // ---------------------------------------------------------------------------
+// ChannelQuality holds per-channel signal quality metrics derived from the
+// averaged power envelope.  Computed once per scope frame.
+// ---------------------------------------------------------------------------
+
+type ChannelQuality struct {
+	ChIdx    int     `json:"ch_idx"`    // channel index (0 … nch-1)
+	GRI      uint32  `json:"gri"`       // GRI value for this channel
+	PeakBin  int     `json:"peak_bin"`  // bucket index of the highest averaged power
+	PeakPwr  float32 `json:"peak_pwr"`  // averaged power at PeakBin (raw float32 units)
+	NoisePwr float32 `json:"noise_pwr"` // mean power of the lowest 50% of buckets (noise floor estimate)
+	SNR      float32 `json:"snr_db"`    // 10·log10(PeakPwr/NoisePwr) in dB; 0 if NoisePwr==0
+	Navgs    uint32  `json:"navgs"`     // number of GRI averages accumulated (CMA only; 0 for EMA/IIR)
+}
+
+// GetAvg returns a copy of the averaged power envelope for channel ch.
+// The returned slice has length c.nbucket (may be 0 if GRI not yet set).
+// Safe to call from any goroutine.
+func (d *LoranDecoder) GetAvg(ch int) []float32 {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	c := &d.ch[ch]
+	if c.nbucket == 0 {
+		return nil
+	}
+	out := make([]float32, c.nbucket)
+	copy(out, c.avg[:c.nbucket])
+	return out
+}
+
+// Quality computes signal quality metrics for channel ch from the current
+// averaged envelope.  Returns zero-value ChannelQuality if GRI not set.
+// Safe to call from any goroutine.
+func (d *LoranDecoder) Quality(ch int) ChannelQuality {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	c := &d.ch[ch]
+	if c.nbucket == 0 || c.gri == 0 {
+		return ChannelQuality{}
+	}
+
+	n := int(c.nbucket)
+	// Find peak bin and collect all values.
+	peakBin := 0
+	peakPwr := float32(0)
+	vals := make([]float32, n)
+	for j := 0; j < n; j++ {
+		vals[j] = c.avg[j]
+		if c.avg[j] > peakPwr {
+			peakPwr = c.avg[j]
+			peakBin = j
+		}
+	}
+
+	// Noise floor: mean of the lower 50% of bucket values (sorted ascending).
+	// Simple selection: copy, sort, average bottom half.
+	sorted := make([]float32, n)
+	copy(sorted, vals)
+	// Insertion sort — n ≤ 1199, fast enough.
+	for i := 1; i < n; i++ {
+		key := sorted[i]
+		j := i - 1
+		for j >= 0 && sorted[j] > key {
+			sorted[j+1] = sorted[j]
+			j--
+		}
+		sorted[j+1] = key
+	}
+	half := n / 2
+	if half < 1 {
+		half = 1
+	}
+	var noiseSum float32
+	for j := 0; j < half; j++ {
+		noiseSum += sorted[j]
+	}
+	noisePwr := noiseSum / float32(half)
+
+	var snr float32
+	if noisePwr > 0 && peakPwr > 0 {
+		snr = float32(10.0 * math.Log10(float64(peakPwr/noisePwr)))
+	}
+
+	navgs := uint32(0)
+	if c.avgAlgo == avgCMA {
+		navgs = c.navgs
+	}
+
+	return ChannelQuality{
+		ChIdx:    ch,
+		GRI:      c.gri,
+		PeakBin:  peakBin,
+		PeakPwr:  peakPwr,
+		NoisePwr: noisePwr,
+		SNR:      snr,
+		Navgs:    navgs,
+	}
+}
+
+// ---------------------------------------------------------------------------
 // ProcessSamples mirrors loran_c_data() in loran_c.cpp
 //
 // samples is a slice of interleaved CS16 IQ pairs: [I0, Q0, I1, Q1, …]

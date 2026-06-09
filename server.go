@@ -5,6 +5,14 @@
 //   - Accepts JSON control messages (gri, gain, offset, avg_algo, avg_param)
 //     and forwards them to the active LoranDecoder
 //
+// REST API:
+//   GET  /api/chains        — full GRI chain database (ChainDB)
+//   GET  /api/config        — runtime config (iq_mode, update_hz, ms_per_bin, channels)
+//   POST /api/control       — decoder control (same JSON as WebSocket control messages)
+//   GET  /api/tdoa          — latest TDOA measurements for all chains
+//   GET  /api/quality       — per-channel signal quality metrics
+//   GET  /api/receiver      — receiver position (lat/lon from /api/description)
+//
 // Proxy-aware: reads X-Forwarded-Prefix header (set by the UberSDR addon proxy)
 // and injects it as BasePath into the index.html template so that all asset
 // URLs and the WebSocket URL are correctly prefixed when served behind
@@ -19,7 +27,9 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"text/template"
+	"unsafe"
 
 	"github.com/gorilla/websocket"
 )
@@ -27,7 +37,7 @@ import (
 // ---------------------------------------------------------------------------
 // Wire protocol — binary frame sent to the browser
 //
-// Matches the format expected by the Loran_C.js frontend:
+// Matches the format expected by the loran_c.js frontend:
 //
 //   Frame header (3 bytes):  "DAT"
 //   Followed by:
@@ -59,12 +69,12 @@ type scopeClient struct {
 // ---------------------------------------------------------------------------
 
 // ScopeServer manages the HTTP mux, connected WebSocket clients, and the
-// active LoranDecoder instance.
+// active LoranDecoder + TDOAEngine instances.
 type ScopeServer struct {
-	staticDir  string
-	indexTmpl  *template.Template
-	sampleRate int
-	updateHz   int
+	staticDir string
+	indexTmpl *template.Template
+	iqMode    string // IQ mode string, e.g. "iq", "iq48", "iq96"
+	updateHz  int
 
 	clientsMu sync.RWMutex
 	clients   map[*scopeClient]struct{}
@@ -72,30 +82,54 @@ type ScopeServer struct {
 	decoderMu sync.RWMutex
 	decoder   *LoranDecoder
 
+	tdoaMu  sync.RWMutex
+	tdoaEng *TDOAEngine
+
+	lopMu  sync.RWMutex
+	lopEng *LOPEngine
+
+	// receiverLat/Lon are the receiver's WGS-84 coordinates fetched from
+	// /api/description.  Stored as float64 bits in atomic.Value for lock-free reads.
+	receiverPos struct {
+		lat float64
+		lon float64
+		mu  sync.RWMutex
+	}
+
+	// wallClockMs is the most recent wall-clock timestamp (ms since Unix epoch)
+	// from the PCM packet header.  Updated atomically.
+	wallClockMs uint64
+
 	mux *http.ServeMux
 }
 
 // NewScopeServer creates a new ScopeServer serving static files from staticDir.
-// index.html is parsed as a Go template so that {{.BasePath}} is substituted
-// with the X-Forwarded-Prefix header value at request time.
-func NewScopeServer(staticDir string, sampleRate, updateHz int) *ScopeServer {
+// iqMode is the IQ mode string (e.g. "iq", "iq48") — used in /api/config.
+// The actual sample rate is determined lazily from the first PCM packet.
+func NewScopeServer(staticDir string, iqMode string, updateHz int) *ScopeServer {
 	tmpl, err := template.ParseFiles(staticDir + "/index.html")
 	if err != nil {
 		log.Fatalf("failed to parse index.html template: %v", err)
 	}
 
 	s := &ScopeServer{
-		staticDir:  staticDir,
-		indexTmpl:  tmpl,
-		sampleRate: sampleRate,
-		updateHz:   updateHz,
-		clients:    make(map[*scopeClient]struct{}),
+		staticDir: staticDir,
+		indexTmpl: tmpl,
+		iqMode:    iqMode,
+		updateHz:  updateHz,
+		clients:   make(map[*scopeClient]struct{}),
 	}
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("/ws", s.handleWS)
 	s.mux.HandleFunc("/api/chains", s.handleAPIChains)
 	s.mux.HandleFunc("/api/config", s.handleAPIConfig)
 	s.mux.HandleFunc("/api/control", s.handleAPIControl)
+	s.mux.HandleFunc("/api/tdoa", s.handleAPITDOA)
+	s.mux.HandleFunc("/api/lops", s.handleAPILOPs)
+	s.mux.HandleFunc("/api/fix", s.handleAPIFix)
+	s.mux.HandleFunc("/api/quality", s.handleAPIQuality)
+	s.mux.HandleFunc("/api/timing", s.handleAPITiming)
+	s.mux.HandleFunc("/api/receiver", s.handleAPIReceiver)
 	s.mux.HandleFunc("/", s.handleHTTP)
 	return s
 }
@@ -108,7 +142,7 @@ func basePath(r *http.Request) string {
 }
 
 // handleHTTP serves index.html as a template for /, and static files for
-// everything else (loran_c.js, style.css, etc.).
+// everything else (loran_c.js, map.js, tdoa_panel.js, etc.).
 func (s *ScopeServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/" || r.URL.Path == "/index.html" {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -123,6 +157,10 @@ func (s *ScopeServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Mux returns the HTTP mux for use with http.ListenAndServe.
 func (s *ScopeServer) Mux() *http.ServeMux { return s.mux }
+
+// ---------------------------------------------------------------------------
+// Decoder / engine setters (called from main.go)
+// ---------------------------------------------------------------------------
 
 // SetDecoder sets (or clears) the active LoranDecoder.
 // Called by the IQ client goroutine when a connection is established or lost.
@@ -142,10 +180,50 @@ func (s *ScopeServer) SetDecoder(d *LoranDecoder) {
 	}
 }
 
+// SetTDOAEngine sets (or clears) the active TDOAEngine.
+func (s *ScopeServer) SetTDOAEngine(e *TDOAEngine) {
+	s.tdoaMu.Lock()
+	s.tdoaEng = e
+	s.tdoaMu.Unlock()
+}
+
+// SetLOPEngine sets (or clears) the active LOPEngine.
+func (s *ScopeServer) SetLOPEngine(e *LOPEngine) {
+	s.lopMu.Lock()
+	s.lopEng = e
+	s.lopMu.Unlock()
+}
+
+// SetReceiverPos stores the receiver's WGS-84 coordinates (from /api/description).
+func (s *ScopeServer) SetReceiverPos(lat, lon float64) {
+	s.receiverPos.mu.Lock()
+	s.receiverPos.lat = lat
+	s.receiverPos.lon = lon
+	s.receiverPos.mu.Unlock()
+
+	// Broadcast updated receiver position to all connected clients.
+	msg := map[string]interface{}{
+		"type": "receiver_pos",
+		"lat":  lat,
+		"lon":  lon,
+	}
+	b, _ := json.Marshal(msg)
+	s.broadcastText(b)
+}
+
+// SetWallClockMs stores the most recent wall-clock timestamp from the PCM header.
+func (s *ScopeServer) SetWallClockMs(ms uint64) {
+	atomic.StoreUint64(&s.wallClockMs, ms)
+}
+
+// ---------------------------------------------------------------------------
+// Broadcast helpers
+// ---------------------------------------------------------------------------
+
 // BroadcastScope sends a scope frame to all connected browser clients.
 // Called from the decoder callback in main.go.
 //
-// Wire format (matches KiwiSDR ext_send_msg_data / Loran_C.js loran_c_recv):
+// Wire format (matches KiwiSDR ext_send_msg_data / loran_c.js loran_c_recv):
 //
 //	"DAT" + cmd(1) + payload(nbucket+1 bytes where payload[0]=ch)
 func (s *ScopeServer) BroadcastScope(ch int, cmd byte, payload []byte) {
@@ -167,12 +245,16 @@ func (s *ScopeServer) BroadcastScope(ch int, cmd byte, payload []byte) {
 }
 
 // broadcastText sends a JSON text message to all connected clients.
+// The byte slice must NOT include the 0xFF prefix — this function adds it.
 func (s *ScopeServer) broadcastText(b []byte) {
 	s.clientsMu.RLock()
 	defer s.clientsMu.RUnlock()
 	for c := range s.clients {
+		frame := make([]byte, 1+len(b))
+		frame[0] = 0xFF // text frame marker
+		copy(frame[1:], b)
 		select {
-		case c.send <- append([]byte{0xFF}, b...): // 0xFF prefix = text frame marker
+		case c.send <- frame:
 		default:
 		}
 	}
@@ -210,7 +292,21 @@ func (s *ScopeServer) handleWS(w http.ResponseWriter, r *http.Request) {
 			"ms_per_bin": d.MsPerBin(),
 		}
 		b, _ := json.Marshal(msg)
-		// Send as text message directly (before the write pump starts).
+		conn.WriteMessage(websocket.TextMessage, b) //nolint:errcheck
+	}
+
+	// Send receiver position immediately if known.
+	s.receiverPos.mu.RLock()
+	lat := s.receiverPos.lat
+	lon := s.receiverPos.lon
+	s.receiverPos.mu.RUnlock()
+	if lat != 0 || lon != 0 {
+		msg := map[string]interface{}{
+			"type": "receiver_pos",
+			"lat":  lat,
+			"lon":  lon,
+		}
+		b, _ := json.Marshal(msg)
 		conn.WriteMessage(websocket.TextMessage, b) //nolint:errcheck
 	}
 
@@ -346,9 +442,10 @@ func (s *ScopeServer) handleAPIChains(w http.ResponseWriter, r *http.Request) {
 
 // configResponse is the JSON shape returned by GET /api/config.
 type configResponse struct {
-	SampleRate int             `json:"sample_rate"`
+	IQMode     string          `json:"iq_mode"`
+	SampleRate int             `json:"sample_rate"` // 0 until first packet received
 	UpdateHz   int             `json:"update_hz"`
-	MsPerBin   float64         `json:"ms_per_bin"`
+	MsPerBin   float64         `json:"ms_per_bin"` // 0 until first packet received
 	Channels   []channelConfig `json:"channels"`
 }
 
@@ -364,7 +461,17 @@ func (s *ScopeServer) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msPerBin := 1.0 / float64(s.sampleRate) * 1e3
+	s.decoderMu.RLock()
+	d := s.decoder
+	s.decoderMu.RUnlock()
+
+	var sampleRate int
+	var msPerBin float64
+	if d != nil {
+		// iSrate is the actual sample rate from the PCM packet header.
+		sampleRate = int(d.iSrate)
+		msPerBin = d.MsPerBin()
+	}
 
 	channels := make([]channelConfig, len(ChainDB))
 	for i, c := range ChainDB {
@@ -372,7 +479,8 @@ func (s *ScopeServer) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := configResponse{
-		SampleRate: s.sampleRate,
+		IQMode:     s.iqMode,
+		SampleRate: sampleRate,
 		UpdateHz:   s.updateHz,
 		MsPerBin:   msPerBin,
 		Channels:   channels,
@@ -388,15 +496,6 @@ func (s *ScopeServer) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 // handleAPIControl serves POST /api/control — accepts the same JSON control
 // messages previously sent over the WebSocket, allowing non-browser clients
 // to adjust decoder parameters via plain HTTP.
-//
-// Supported body shapes (same as handleControl):
-//
-//	{ "type": "set_gri",       "ch": 0, "gri": 8000 }
-//	{ "type": "set_gain",      "ch": 0, "gain": 0 }
-//	{ "type": "set_offset",    "ch": 0, "offset": 42 }
-//	{ "type": "set_avg_algo",  "ch": 0, "algo": 1 }
-//	{ "type": "set_avg_param", "ch": 0, "param": 256.0 }
-//	{ "type": "start" }
 func (s *ScopeServer) handleAPIControl(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -418,6 +517,191 @@ func (s *ScopeServer) handleAPIControl(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// handleAPITDOA serves GET /api/tdoa — latest TDOA measurements.
+//
+// Response: JSON array of TDOAMeasurement objects.
+// Returns 503 if no decoder is active yet.
+func (s *ScopeServer) handleAPITDOA(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	s.tdoaMu.RLock()
+	eng := s.tdoaEng
+	s.tdoaMu.RUnlock()
+
+	if eng == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":"decoder not yet active"}`)) //nolint:errcheck
+		return
+	}
+
+	results := eng.Results()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(results); err != nil {
+		log.Printf("handleAPITDOA encode: %v", err)
+	}
+}
+
+// qualityResponse is the JSON shape returned by GET /api/quality.
+type qualityResponse struct {
+	Channels []ChannelQuality `json:"channels"`
+	WallMs   uint64           `json:"wall_clock_ms"` // most recent PCM wall-clock timestamp
+}
+
+// handleAPIQuality serves GET /api/quality — per-channel signal quality metrics.
+func (s *ScopeServer) handleAPIQuality(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	s.decoderMu.RLock()
+	d := s.decoder
+	s.decoderMu.RUnlock()
+
+	if d == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":"decoder not yet active"}`)) //nolint:errcheck
+		return
+	}
+
+	channels := make([]ChannelQuality, nch)
+	for i := 0; i < nch; i++ {
+		channels[i] = d.Quality(i)
+	}
+
+	resp := qualityResponse{
+		Channels: channels,
+		WallMs:   atomic.LoadUint64(&s.wallClockMs),
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("handleAPIQuality encode: %v", err)
+	}
+}
+
+// receiverResponse is the JSON shape returned by GET /api/receiver.
+type receiverResponse struct {
+	Lat    float64 `json:"lat"`
+	Lon    float64 `json:"lon"`
+	IQMode string  `json:"iq_mode"`
+}
+
+// handleAPIReceiver serves GET /api/receiver — receiver position and IQ mode.
+func (s *ScopeServer) handleAPIReceiver(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	s.receiverPos.mu.RLock()
+	lat := s.receiverPos.lat
+	lon := s.receiverPos.lon
+	s.receiverPos.mu.RUnlock()
+
+	resp := receiverResponse{
+		Lat:    lat,
+		Lon:    lon,
+		IQMode: s.iqMode,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("handleAPIReceiver encode: %v", err)
+	}
+}
+
+// handleAPITiming serves GET /api/timing — UTC wall-clock timing from PCM header.
+func (s *ScopeServer) handleAPITiming(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Content-Type", "application/json")
+	info := s.GetTimingInfo()
+	if err := json.NewEncoder(w).Encode(info); err != nil {
+		log.Printf("handleAPITiming encode: %v", err)
+	}
+}
+
+// handleAPILOPs serves GET /api/lops — latest Lines of Position.
+//
+// Response: JSON array of LOP objects (each with a sampled polyline).
+// Returns 503 if no LOP engine is active yet.
+func (s *ScopeServer) handleAPILOPs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	s.lopMu.RLock()
+	eng := s.lopEng
+	s.lopMu.RUnlock()
+
+	if eng == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":"LOP engine not yet active"}`)) //nolint:errcheck
+		return
+	}
+
+	lops := eng.LOPs()
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(lops); err != nil {
+		log.Printf("handleAPILOPs encode: %v", err)
+	}
+}
+
+// handleAPIFix serves GET /api/fix — Gauss-Newton position fix.
+//
+// Uses the latest TDOA measurements and the receiver's known position as the
+// initial estimate.  Returns 503 if no TDOA engine is active.
+func (s *ScopeServer) handleAPIFix(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	s.tdoaMu.RLock()
+	eng := s.tdoaEng
+	s.tdoaMu.RUnlock()
+
+	if eng == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		w.Write([]byte(`{"error":"TDOA engine not yet active"}`)) //nolint:errcheck
+		return
+	}
+
+	s.receiverPos.mu.RLock()
+	initialPos := LatLon{Lat: s.receiverPos.lat, Lon: s.receiverPos.lon}
+	s.receiverPos.mu.RUnlock()
+
+	// Fall back to a central European position if receiver pos unknown.
+	if initialPos.Lat == 0 && initialPos.Lon == 0 {
+		initialPos = LatLon{Lat: 51.5, Lon: 0.0} // London as fallback
+	}
+
+	measurements := eng.Results()
+	fix := ComputeFix(measurements, initialPos, loranPropSpeedKmS, 20)
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(fix); err != nil {
+		log.Printf("handleAPIFix encode: %v", err)
+	}
+}
+
 // floatVal safely extracts a float64 from a JSON map value.
 func floatVal(m map[string]interface{}, key string) float64 {
 	v, ok := m[key]
@@ -436,3 +720,8 @@ func floatVal(m map[string]interface{}, key string) float64 {
 	}
 	return 0
 }
+
+// Ensure atomic.StoreUint64 alignment on 32-bit platforms.
+// wallClockMs is a uint64 field in ScopeServer — Go guarantees 64-bit
+// alignment for struct fields on all platforms when using sync/atomic.
+var _ = unsafe.Sizeof(ScopeServer{})

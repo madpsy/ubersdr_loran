@@ -1,17 +1,30 @@
 // ubersdr_loran — Loran-C pulse-envelope viewer for UberSDR
 //
 // Connects to an UberSDR instance, requests an IQ stream centred on 100 kHz,
-// decodes the Loran-C pulse envelope for up to two simultaneous GRI chains,
-// and serves a browser-based scope display on a local HTTP port.
+// decodes the Loran-C pulse envelope for all 14 simultaneous GRI chains,
+// and serves a browser-based scope display + TDOA/position fix on a local HTTP port.
 //
 // Usage:
 //
 //	ubersdr_loran [flags]
 //	  -url      string   UberSDR base URL, e.g. http://host:8080  (required)
 //	  -pass     string   Bypass password (optional)
-//	  -web-port int      Port for the scope web UI (default: 8095)
+//	  -web-port int      Port for the scope web UI (default: 6088)
 //	  -web-static string Path to static web files (default: ./static)
+//	  -update-hz int     Scope update rate in Hz (default: 10)
 //	  -no-reconnect      Disable auto-reconnect on disconnect
+//
+// The IQ mode ("iq" by default, giving ±5 kHz / 10 kHz sample rate) can be
+// overridden with -mode.  Wide IQ modes require a bypass password:
+//
+//	"iq"    → ±5 kHz   → 10,000 Hz sample rate → 100 µs/bin
+//	"iq48"  → ±24 kHz  → 48,000 Hz sample rate → ~20.8 µs/bin
+//	"iq96"  → ±48 kHz  → 96,000 Hz sample rate → ~10.4 µs/bin
+//	"iq192" → ±96 kHz  → 192,000 Hz sample rate → ~5.2 µs/bin
+//	"iq384" → ±192 kHz → 384,000 Hz sample rate → ~2.6 µs/bin
+//
+// The actual sample rate is read from the PCM packet header on the first
+// full packet — no hardcoded assumptions are made.
 
 package main
 
@@ -38,13 +51,6 @@ import (
 
 // loranFrequencyHz is the Loran-C carrier frequency.
 const loranFrequencyHz = 100000
-
-// iqMode is the UberSDR IQ mode used — "iq" gives 10 kHz bandwidth at 10,000 Hz sample rate,
-// which is sufficient for Loran-C pulse envelope detection.
-const iqMode = "iq"
-
-// iqSampleRate is the sample rate delivered by the "iq" mode.
-const iqSampleRate = 10000
 
 // defaultWebPort is the default port for the scope web UI.
 const defaultWebPort = 6088
@@ -99,6 +105,55 @@ type wsMessage struct {
 }
 
 // ---------------------------------------------------------------------------
+// UberSDR /api/description response (subset of fields we care about)
+// ---------------------------------------------------------------------------
+
+// receiverDescription holds the fields we need from GET /api/description.
+// The full response contains many more fields; we only decode what we use.
+type receiverDescription struct {
+	Receiver struct {
+		Name     string `json:"name"`
+		Callsign string `json:"callsign"`
+		Location string `json:"location"`
+		GPS      struct {
+			Lat        float64 `json:"lat"`
+			Lon        float64 `json:"lon"`
+			Maidenhead string  `json:"maidenhead"`
+			GPSEnabled bool    `json:"gps_enabled"`
+		} `json:"gps"`
+	} `json:"receiver"`
+}
+
+// fetchDescription calls GET /api/description on the UberSDR server and
+// returns the parsed response.  Errors are non-fatal — callers fall back
+// gracefully (e.g. receiver position stays at 0,0).
+func fetchDescription(httpBase string) (*receiverDescription, error) {
+	endpoint := strings.TrimRight(httpBase, "/") + "/api/description"
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "ubersdr_loran/1.0")
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET /api/description returned HTTP %d", resp.StatusCode)
+	}
+
+	var desc receiverDescription
+	if err := json.NewDecoder(resp.Body).Decode(&desc); err != nil {
+		return nil, fmt.Errorf("decode /api/description: %w", err)
+	}
+	return &desc, nil
+}
+
+// ---------------------------------------------------------------------------
 // PCM binary packet decoder (mirrors ubersdr_hfdl/main.go)
 // ---------------------------------------------------------------------------
 //
@@ -138,6 +193,7 @@ type pcmDecoder struct {
 	zd           *zstd.Decoder
 	lastRate     int
 	lastChannels int
+	lastWallMs   uint64 // wall-clock ms from the most recent full header
 }
 
 func newPCMDecoder() (*pcmDecoder, error) {
@@ -149,23 +205,25 @@ func newPCMDecoder() (*pcmDecoder, error) {
 }
 
 // decode decompresses (if needed) and parses a binary PCM packet.
-// Returns big-endian int16 samples converted to little-endian, sample rate, channel count.
-func (d *pcmDecoder) decode(data []byte, isZstd bool) ([]byte, int, int, error) {
+// Returns big-endian int16 samples converted to little-endian, sample rate,
+// channel count, and wall-clock timestamp in milliseconds (0 for minimal headers).
+func (d *pcmDecoder) decode(data []byte, isZstd bool) ([]byte, int, int, uint64, error) {
 	if isZstd {
 		var err error
 		data, err = d.zd.DecodeAll(data, nil)
 		if err != nil {
-			return nil, 0, 0, fmt.Errorf("zstd decompress: %w", err)
+			return nil, 0, 0, 0, fmt.Errorf("zstd decompress: %w", err)
 		}
 	}
 
 	if len(data) < 4 {
-		return nil, 0, 0, fmt.Errorf("packet too short (%d bytes)", len(data))
+		return nil, 0, 0, 0, fmt.Errorf("packet too short (%d bytes)", len(data))
 	}
 
 	magic := binary.LittleEndian.Uint16(data[0:2])
 
 	var rate, ch int
+	var wallMs uint64
 	var raw []byte
 
 	switch magic {
@@ -179,27 +237,30 @@ func (d *pcmDecoder) decode(data []byte, isZstd bool) ([]byte, int, int, error) 
 			headerLen = 29
 		}
 		if len(data) < headerLen {
-			return nil, 0, 0, fmt.Errorf("full-header packet too short (%d < %d)", len(data), headerLen)
+			return nil, 0, 0, 0, fmt.Errorf("full-header packet too short (%d < %d)", len(data), headerLen)
 		}
+		wallMs = binary.LittleEndian.Uint64(data[12:20])
 		rate = int(binary.LittleEndian.Uint32(data[20:24]))
 		ch = int(data[24])
 		raw = data[headerLen:]
 		d.lastRate = rate
 		d.lastChannels = ch
+		d.lastWallMs = wallMs
 
 	case magicMinimal:
 		if len(data) < 13 {
-			return nil, 0, 0, fmt.Errorf("minimal-header packet too short (%d bytes)", len(data))
+			return nil, 0, 0, 0, fmt.Errorf("minimal-header packet too short (%d bytes)", len(data))
 		}
 		raw = data[13:]
 		rate = d.lastRate
 		ch = d.lastChannels
+		wallMs = d.lastWallMs
 		if rate == 0 || ch == 0 {
-			return nil, 0, 0, fmt.Errorf("minimal header received before full header")
+			return nil, 0, 0, 0, fmt.Errorf("minimal header received before full header")
 		}
 
 	default:
-		return nil, 0, 0, fmt.Errorf("unknown magic 0x%04X", magic)
+		return nil, 0, 0, 0, fmt.Errorf("unknown magic 0x%04X", magic)
 	}
 
 	// Convert big-endian int16 → little-endian int16
@@ -209,7 +270,7 @@ func (d *pcmDecoder) decode(data []byte, isZstd bool) ([]byte, int, int, error) 
 		s := binary.BigEndian.Uint16(raw[i*2:])
 		binary.LittleEndian.PutUint16(le[i*2:], s)
 	}
-	return le, rate, ch, nil
+	return le, rate, ch, wallMs, nil
 }
 
 func (d *pcmDecoder) close() { d.zd.Close() }
@@ -221,6 +282,7 @@ func (d *pcmDecoder) close() { d.zd.Close() }
 type client struct {
 	baseURL       string
 	password      string
+	iqMode        string // IQ mode: "iq", "iq48", "iq96", "iq192", "iq384"
 	sessionID     string
 	autoReconnect bool
 	running       bool
@@ -254,7 +316,7 @@ func (c *client) wsURL() string {
 
 	q := url.Values{}
 	q.Set("frequency", fmt.Sprintf("%d", loranFrequencyHz))
-	q.Set("mode", iqMode)
+	q.Set("mode", c.iqMode)
 	q.Set("format", "pcm-zstd")
 	q.Set("user_session_id", c.sessionID)
 	if c.password != "" {
@@ -303,6 +365,17 @@ func (c *client) checkConnection() (bool, error) {
 func (c *client) runOnce() (reconnect bool) {
 	c.sessionID = uuid.New().String()
 
+	// Fetch /api/description to get receiver lat/lon and update the server.
+	if desc, err := fetchDescription(c.httpBase()); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not fetch /api/description: %v\n", err)
+	} else {
+		lat := desc.Receiver.GPS.Lat
+		lon := desc.Receiver.GPS.Lon
+		c.server.SetReceiverPos(lat, lon)
+		fmt.Fprintf(os.Stderr, "receiver position: lat=%.6f lon=%.6f (%s) [%s]\n",
+			lat, lon, desc.Receiver.GPS.Maidenhead, desc.Receiver.Name)
+	}
+
 	allowed, err := c.checkConnection()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -324,8 +397,8 @@ func (c *client) runOnce() (reconnect bool) {
 	}
 	defer conn.Close()
 
-	fmt.Fprintf(os.Stderr, "connected — freq=%d Hz, mode=%s, sample rate=%d Hz\n",
-		loranFrequencyHz, iqMode, iqSampleRate)
+	fmt.Fprintf(os.Stderr, "connected — freq=%d Hz, mode=%s (sample rate determined from first packet)\n",
+		loranFrequencyHz, c.iqMode)
 
 	dec, err := newPCMDecoder()
 	if err != nil {
@@ -334,13 +407,11 @@ func (c *client) runOnce() (reconnect bool) {
 	}
 	defer dec.close()
 
-	// Create the Loran-C decoder for this connection.
-	loranDec := NewLoranDecoder(float64(iqSampleRate), c.updateHz)
-	loranDec.Start()
-
-	// Notify the scope server of the new decoder so the browser can connect.
-	c.server.SetDecoder(loranDec)
-	defer c.server.SetDecoder(nil)
+	// The Loran decoder is created lazily on the first full PCM packet so
+	// that we use the actual sample rate from the packet header rather than
+	// any hardcoded constant.
+	var loranDec *LoranDecoder
+	var tdoaEng *TDOAEngine
 
 	// Keepalive goroutine.
 	ctx, cancel := context.WithCancel(context.Background())
@@ -361,8 +432,6 @@ func (c *client) runOnce() (reconnect bool) {
 		}
 	}()
 
-	firstPacket := true
-
 	for c.running {
 		msgType, msg, err := conn.ReadMessage()
 		if err != nil {
@@ -376,7 +445,7 @@ func (c *client) runOnce() (reconnect bool) {
 
 		switch msgType {
 		case websocket.BinaryMessage:
-			pcmBytes, rate, ch, err := dec.decode(msg, true /* pcm-zstd */)
+			pcmBytes, rate, ch, wallMs, err := dec.decode(msg, true /* pcm-zstd */)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "decode error: %v\n", err)
 				continue
@@ -384,9 +453,24 @@ func (c *client) runOnce() (reconnect bool) {
 			if len(pcmBytes) == 0 {
 				continue
 			}
-			if firstPacket {
-				fmt.Fprintf(os.Stderr, "receiving IQ: %d Hz, %d channel(s)\n", rate, ch)
-				firstPacket = false
+
+			// Lazy initialisation: create the Loran decoder on the first packet
+			// using the actual sample rate from the PCM header.
+			if loranDec == nil {
+				fmt.Fprintf(os.Stderr, "receiving IQ: %d Hz sample rate, %d channel(s), mode=%s\n",
+					rate, ch, c.iqMode)
+				loranDec = NewLoranDecoder(float64(rate), c.updateHz)
+				loranDec.Start()
+				tdoaEng = NewTDOAEngine(loranDec)
+				lopEng := NewLOPEngine(tdoaEng)
+				c.server.SetDecoder(loranDec)
+				c.server.SetTDOAEngine(tdoaEng)
+				c.server.SetLOPEngine(lopEng)
+			}
+
+			// Pass wall-clock timestamp to the timing engine (if available).
+			if wallMs > 0 {
+				c.server.SetWallClockMs(wallMs)
 			}
 
 			// Convert raw bytes → []int16 (little-endian, interleaved I/Q).
@@ -399,6 +483,18 @@ func (c *client) runOnce() (reconnect bool) {
 			// Feed samples to the Loran-C decoder; broadcast any scope frames.
 			loranDec.ProcessSamples(samples, func(chIdx int, cmd byte, payload []byte) {
 				c.server.BroadcastScope(chIdx, cmd, payload)
+				// After each scope frame, update TDOA and LOP measurements.
+				if tdoaEng != nil {
+					tdoaEng.Update()
+					// LOPEngine reads from TDOAEngine — update after TDOA.
+					s := c.server
+					s.lopMu.RLock()
+					lop := s.lopEng
+					s.lopMu.RUnlock()
+					if lop != nil {
+						lop.Update()
+					}
+				}
 			})
 
 		case websocket.TextMessage:
@@ -420,6 +516,11 @@ func (c *client) runOnce() (reconnect bool) {
 		}
 	}
 
+	if loranDec != nil {
+		c.server.SetDecoder(nil)
+		c.server.SetTDOAEngine(nil)
+		c.server.SetLOPEngine(nil)
+	}
 	return false
 }
 
@@ -465,6 +566,7 @@ func main() {
 	var (
 		rawURL    = flag.String("url", "", "UberSDR base URL, e.g. http://host:8080 (required)")
 		pass      = flag.String("pass", "", "Bypass password (optional)")
+		iqMode    = flag.String("mode", "iq", "IQ mode: iq (10kHz), iq48, iq96, iq192, iq384 (wide modes require bypass)")
 		webPort   = flag.Int("web-port", defaultWebPort, "Port for the Loran-C scope web UI")
 		webStatic = flag.String("web-static", "./static", "Path to static web files directory")
 		updateHz  = flag.Int("update-hz", 10, "Scope update rate in Hz (1=KiwiSDR-compatible, 10=default, max ~25)")
@@ -473,14 +575,24 @@ func main() {
 	flag.Parse()
 
 	if *rawURL == "" {
-		fmt.Fprintf(os.Stderr, "Usage: ubersdr_loran -url <http://host:port> [-pass <password>] [-web-port <port>] [-web-static <path>] [-update-hz <hz>] [-no-reconnect]\n\n")
-		fmt.Fprintf(os.Stderr, "  Connects to UberSDR at 100 kHz (Loran-C carrier) using IQ mode (%d Hz sample rate)\n", iqSampleRate)
-		fmt.Fprintf(os.Stderr, "  and serves a Loran-C pulse-envelope scope at http://localhost:%d/\n", defaultWebPort)
+		fmt.Fprintf(os.Stderr, "Usage: ubersdr_loran -url <http://host:port> [-pass <password>] [-mode <iq|iq48|iq96|iq192|iq384>] [-web-port <port>] [-web-static <path>] [-update-hz <hz>] [-no-reconnect]\n\n")
+		fmt.Fprintf(os.Stderr, "  Connects to UberSDR at 100 kHz (Loran-C carrier) using the specified IQ mode\n")
+		fmt.Fprintf(os.Stderr, "  and serves a Loran-C pulse-envelope scope + TDOA/position fix at http://localhost:%d/\n", defaultWebPort)
+		os.Exit(1)
+	}
+
+	// Validate IQ mode.
+	validModes := map[string]bool{
+		"iq": true, "iq48": true, "iq96": true, "iq192": true, "iq384": true,
+	}
+	if !validModes[*iqMode] {
+		fmt.Fprintf(os.Stderr, "error: invalid mode %q — must be one of: iq, iq48, iq96, iq192, iq384\n", *iqMode)
 		os.Exit(1)
 	}
 
 	// Start the scope HTTP/WebSocket server.
-	server := NewScopeServer(*webStatic, iqSampleRate, *updateHz)
+	// Sample rate is 0 here — it will be updated from the first PCM packet.
+	server := NewScopeServer(*webStatic, *iqMode, *updateHz)
 	go func() {
 		addr := fmt.Sprintf(":%d", *webPort)
 		fmt.Fprintf(os.Stderr, "scope server listening on http://localhost%s/\n", addr)
@@ -493,6 +605,7 @@ func main() {
 	c := &client{
 		baseURL:       *rawURL,
 		password:      *pass,
+		iqMode:        *iqMode,
 		sessionID:     uuid.New().String(),
 		autoReconnect: !*noReconn,
 		running:       true,

@@ -4,6 +4,11 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Loran-C Viewer</title>
+
+<!-- Leaflet CSS -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+
 <style>
   :root {
     --bg:        #0d0d0f;
@@ -13,6 +18,7 @@
     --muted:     #6b6b7a;
     --accent:    #00d4ff;
     --ok:        #22c55e;
+    --warn:      #f59e0b;
     --err:       #ef4444;
     --radius:    10px;
     --font:      "Inter", system-ui, -apple-system, sans-serif;
@@ -27,6 +33,9 @@
     font-size: 13px;
     min-height: 100vh;
     padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
   }
 
   /* ── Header ─────────────────────────────────────────────── */
@@ -34,7 +43,7 @@
     display: flex;
     align-items: center;
     gap: 14px;
-    margin-bottom: 14px;
+    flex-shrink: 0;
   }
 
   .logo {
@@ -99,12 +108,22 @@
   }
   .status-err::before { background: var(--err); }
 
+  /* ── Main content area — scope + map side by side ────────── */
+  #main-row {
+    display: flex;
+    gap: 12px;
+    flex: 1;
+    min-height: 0;
+  }
+
   /* ── Scope card ──────────────────────────────────────────── */
   #scope-card {
     background: var(--surface);
     border: 1px solid var(--border);
     border-radius: var(--radius);
     overflow: hidden;
+    flex: 1 1 55%;
+    min-width: 0;
   }
 
   #scope-container {
@@ -118,13 +137,166 @@
     width: 100%;
   }
 
+  /* ── Map card ────────────────────────────────────────────── */
+  #map-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    flex: 1 1 45%;
+    min-width: 280px;
+    display: flex;
+    flex-direction: column;
+  }
+
+  #map-card-header {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  #fix-badge {
+    margin-left: auto;
+    font-size: 10px;
+    font-weight: 500;
+    padding: 2px 8px;
+    border-radius: 999px;
+    background: #1a1a20;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    letter-spacing: 0;
+    text-transform: none;
+  }
+
+  #map-panel {
+    flex: 1;
+    min-height: 300px;
+    background: #111118;
+  }
+
+  /* Override Leaflet dark theme */
+  .leaflet-container {
+    background: #111118 !important;
+    font-family: var(--font) !important;
+  }
+
+  .leaflet-tile-pane { filter: brightness(0.75) saturate(0.6); }
+
+  .leaflet-popup-content-wrapper {
+    background: var(--surface);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 4px 20px #0008;
+  }
+  .leaflet-popup-tip { background: var(--surface); }
+  .leaflet-popup-content { font-size: 12px; line-height: 1.6; }
+
+  /* ── TDOA / Quality panel ────────────────────────────────── */
+  #tdoa-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
+    flex-shrink: 0;
+  }
+
+  #tdoa-card-header {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+
+  #tdoa-panel {
+    overflow-x: auto;
+  }
+
+  #tdoa-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  #tdoa-table thead th {
+    padding: 6px 10px;
+    text-align: left;
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--muted);
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+  }
+
+  #tdoa-table tbody tr {
+    border-bottom: 1px solid #1e1e24;
+    transition: background 0.15s;
+  }
+
+  #tdoa-table tbody tr:last-child { border-bottom: none; }
+  #tdoa-table tbody tr:hover { background: #1e1e26; }
+
+  #tdoa-table tbody td {
+    padding: 5px 10px;
+    white-space: nowrap;
+    vertical-align: middle;
+  }
+
+  /* colour-dot indicator */
+  .snr-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    margin-right: 5px;
+    vertical-align: middle;
+    flex-shrink: 0;
+  }
+
+  .snr-good  { background: var(--ok);   box-shadow: 0 0 4px var(--ok); }
+  .snr-warn  { background: var(--warn); box-shadow: 0 0 4px var(--warn); }
+  .snr-bad   { background: var(--err);  box-shadow: 0 0 4px var(--err); }
+  .snr-none  { background: var(--muted); }
+
+  .val-good  { color: var(--ok); }
+  .val-warn  { color: var(--warn); }
+  .val-bad   { color: var(--err); }
+  .val-muted { color: var(--muted); }
+
   /* ── Footer hint ─────────────────────────────────────────── */
   .hint {
-    margin-top: 10px;
     color: var(--muted);
     font-size: 11px;
     text-align: center;
     letter-spacing: 0.01em;
+    flex-shrink: 0;
+  }
+
+  /* ── Responsive: stack on narrow screens ─────────────────── */
+  @media (max-width: 900px) {
+    #main-row {
+      flex-direction: column;
+    }
+    #map-card {
+      flex: none;
+      height: 320px;
+    }
+    #map-panel {
+      min-height: 0;
+    }
   }
 </style>
 </head>
@@ -139,15 +311,57 @@
   <span id="status" class="status-err">Connecting…</span>
 </header>
 
-<div id="scope-card">
-  <div id="scope-container">
-    <canvas id="scope"></canvas>
+<!-- Scope + Map side by side -->
+<div id="main-row">
+
+  <div id="scope-card">
+    <div id="scope-container">
+      <canvas id="scope"></canvas>
+    </div>
+  </div>
+
+  <div id="map-card">
+    <div id="map-card-header">
+      🗺 Position Map
+      <span id="fix-badge">No fix</span>
+    </div>
+    <div id="map-panel"></div>
+  </div>
+
+</div>
+
+<!-- TDOA / Quality table -->
+<div id="tdoa-card">
+  <div id="tdoa-card-header">TDOA Measurements &amp; Signal Quality</div>
+  <div id="tdoa-panel">
+    <table id="tdoa-table">
+      <thead>
+        <tr>
+          <th>Chain</th>
+          <th>Master SNR</th>
+          <th>Secondary</th>
+          <th>Sec SNR</th>
+          <th>TDOA µs</th>
+          <th>Valid</th>
+        </tr>
+      </thead>
+      <tbody id="tdoa-tbody">
+        <tr><td colspan="6" class="val-muted" style="padding:12px 10px;text-align:center">Waiting for measurements…</td></tr>
+      </tbody>
+    </table>
   </div>
 </div>
 
-<p class="hint">Click a row to shift-align that chain's master station pulse</p>
+<p class="hint">Click a scope row to shift-align that chain's master station pulse</p>
 
 <script>window.BASE_PATH = "{{.BasePath}}";</script>
+
+<!-- Leaflet JS -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV/XN/WLs=" crossorigin=""></script>
+
 <script src="{{.BasePath}}/loran_c.js"></script>
+<script src="{{.BasePath}}/map.js"></script>
+<script src="{{.BasePath}}/tdoa_panel.js"></script>
 </body>
 </html>

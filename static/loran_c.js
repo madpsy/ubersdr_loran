@@ -1,8 +1,13 @@
 // loran_c.js — Loran-C scope renderer for ubersdr_loran
 //
 // All chain metadata is fetched from GET /api/chains and GET /api/config.
-// The WebSocket carries only binary scope frames.
+// The WebSocket carries binary scope frames and JSON push messages.
 // Zero hardcoded domain knowledge in this file.
+//
+// Exposes to other scripts:
+//   window.loranChains        — Chain[] from /api/chains (set after bootstrap)
+//   window.loranTraceColors   — colour palette (set immediately)
+//   window.loranWsSubscribe(fn) — register a JSON WS message handler
 
 'use strict';
 
@@ -29,6 +34,13 @@ const TRACE_COLORS = [
     '#cc88ff', '#ff88cc', '#88ccff', '#ffcc44',
 ];
 
+// Expose palette for map.js / tdoa_panel.js
+window.loranTraceColors = TRACE_COLORS;
+
+// SNR thresholds for badge colouring (dB)
+const SNR_GOOD = 15;
+const SNR_WARN  = 8;
+
 // ---------------------------------------------------------------------------
 // Runtime state — populated from /api/chains and /api/config
 // ---------------------------------------------------------------------------
@@ -41,6 +53,14 @@ let NCH      = 0;
 // nbuckets per channel (updated when first data arrives)
 let nbuckets = [];
 
+// Per-channel quality (from quality_update WS messages)
+// key = chIdx, value = { snr, peak_bin, ... }
+const channelQuality = {};
+
+// Per-channel TDOA measurements (from tdoa_update WS messages)
+// key = chIdx, value = TDOAMeasurement[]
+const channelTDOA = {};
+
 // ---------------------------------------------------------------------------
 // Canvas state
 // ---------------------------------------------------------------------------
@@ -50,12 +70,58 @@ let canvas, ctx;
 let scopeWidth = 0;
 
 // ---------------------------------------------------------------------------
+// WS JSON subscriber list
+// ---------------------------------------------------------------------------
+
+const wsSubscribers = [];
+
+/**
+ * Register a callback to receive JSON WebSocket messages.
+ * Called by map.js and tdoa_panel.js.
+ */
+window.loranWsSubscribe = function (fn) {
+    wsSubscribers.push(fn);
+};
+
+function dispatchWsMessage(msg) {
+    wsSubscribers.forEach(fn => {
+        try { fn(msg); } catch (e) { console.error('WS subscriber error', e); }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Layout helpers
 // ---------------------------------------------------------------------------
 
 function rowTop(i)    { return i * ROW_HEIGHT; }
 function rowBottom(i) { return (i + 1) * ROW_HEIGHT - H_LEGEND; }
 function scopeH()     { return ROW_HEIGHT - H_LEGEND; }
+
+// ---------------------------------------------------------------------------
+// Quality polling — keeps SNR badges fresh (server may not push quality_update)
+// ---------------------------------------------------------------------------
+
+async function pollQuality() {
+    if (NCH === 0) return; // not yet bootstrapped
+    try {
+        const resp = await fetch(BASE_PATH + '/api/quality');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        // Response shape: {channels: ChannelQuality[], wall_clock_ms: ...}
+        const channels = data.channels || data;
+        if (!Array.isArray(channels)) return;
+        let changed = false;
+        channels.forEach(q => {
+            if (q.ch_idx !== undefined) {
+                channelQuality[q.ch_idx] = q;
+                changed = true;
+            }
+        });
+        if (changed) {
+            for (let i = 0; i < NCH; i++) drawLegend(i);
+        }
+    } catch (e) { /* ignore */ }
+}
 
 // ---------------------------------------------------------------------------
 // Bootstrap — fetch config then connect
@@ -77,11 +143,26 @@ async function bootstrap() {
         NCH      = chains.length;
         nbuckets = new Array(NCH).fill(0);
 
+        // Expose chains for map.js / tdoa_panel.js
+        window.loranChains = chains;
+
         resizeCanvas();
         window.addEventListener('resize', resizeCanvas);
         canvas.addEventListener('click', onCanvasClick);
 
         connect();
+
+        // Poll quality endpoint to keep SNR badges fresh (1 Hz)
+        pollQuality();
+        setInterval(pollQuality, 1000);
+
+        // Initialise sibling modules after chains are available
+        if (typeof window.mapInit === 'function') {
+            window.mapInit(chains, TRACE_COLORS);
+        }
+        if (typeof window.tdoaPanelInit === 'function') {
+            window.tdoaPanelInit();
+        }
     } catch (err) {
         console.error('bootstrap failed:', err);
         document.getElementById('status').textContent = 'Config error: ' + err.message;
@@ -92,7 +173,7 @@ async function bootstrap() {
 }
 
 // ---------------------------------------------------------------------------
-// WebSocket — binary scope frames only
+// WebSocket — binary scope frames + JSON push messages
 // ---------------------------------------------------------------------------
 
 function connect() {
@@ -124,20 +205,69 @@ function connect() {
         if (evt.data instanceof ArrayBuffer) {
             handleBinary(evt.data);
         } else {
-            // Text frame: server may push updated ms_per_bin on reconnect
             try {
                 const msg = JSON.parse(evt.data);
-                if (msg.type === 'ms_per_bin') {
-                    msPerBin = parseFloat(msg.ms_per_bin);
-                    for (let i = 0; i < NCH; i++) drawLegend(i);
-                }
-            } catch(e) { /* ignore */ }
+                handleJsonMessage(msg);
+            } catch(e) { /* ignore malformed */ }
         }
     };
 }
 
 function sendWS(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
+}
+
+// ---------------------------------------------------------------------------
+// JSON message dispatcher
+// ---------------------------------------------------------------------------
+
+function handleJsonMessage(msg) {
+    switch (msg.type) {
+        case 'ms_per_bin':
+            msPerBin = parseFloat(msg.ms_per_bin);
+            for (let i = 0; i < NCH; i++) drawLegend(i);
+            break;
+
+        case 'quality_update': {
+            // Server may push {channels: [...]} or {quality: [...]}
+            const qArr = msg.channels || msg.quality;
+            if (Array.isArray(qArr)) {
+                qArr.forEach(q => {
+                    if (q.ch_idx !== undefined) {
+                        channelQuality[q.ch_idx] = q;
+                        if (q.ch_idx < NCH) drawLegend(q.ch_idx);
+                    }
+                });
+            }
+            break;
+        }
+
+        case 'tdoa_update': {
+            // measurements is TDOAMeasurement[] — keyed by chain_gri, not ch_idx
+            const mArr = msg.measurements;
+            if (Array.isArray(mArr)) {
+                mArr.forEach(m => {
+                    // Map chain_gri → ch_idx via chains array
+                    const chIdx = chains.findIndex(c => c.gri === m.chain_gri);
+                    if (chIdx < 0) return;
+                    if (!channelTDOA[chIdx]) channelTDOA[chIdx] = [];
+                    const arr = channelTDOA[chIdx];
+                    const idx = arr.findIndex(x => x.secondary_id === m.secondary_id);
+                    if (idx >= 0) arr[idx] = m; else arr.push(m);
+                });
+                // Redraw peak markers for all affected channels
+                const affected = new Set(
+                    mArr.map(m => chains.findIndex(c => c.gri === m.chain_gri))
+                        .filter(i => i >= 0)
+                );
+                affected.forEach(ch => { if (ch < NCH) drawPeakMarkers(ch); });
+            }
+            break;
+        }
+    }
+
+    // Forward to all subscribers (map.js, tdoa_panel.js)
+    dispatchWsMessage(msg);
 }
 
 // ---------------------------------------------------------------------------
@@ -153,10 +283,12 @@ function handleBinary(buf) {
     if (chIdx < 0 || chIdx >= NCH) return;
     nbuckets[chIdx] = data.length;
     drawScope(chIdx, cmd, data);
+    // Redraw peak markers on top of fresh trace
+    drawPeakMarkers(chIdx);
 }
 
 // ---------------------------------------------------------------------------
-// Drawing
+// Drawing — scope trace
 // ---------------------------------------------------------------------------
 
 function drawScope(chIdx, cmd, data) {
@@ -227,6 +359,95 @@ function drawScope(chIdx, cmd, data) {
     ctx.fillRect(sx + blen, rowTop(chIdx), scopeWidth - sx - blen + 1, yh);
 }
 
+// ---------------------------------------------------------------------------
+// Drawing — peak markers (overlaid on top of trace)
+// ---------------------------------------------------------------------------
+
+function drawPeakMarkers(chIdx) {
+    if (!canvas || chIdx >= chains.length) return;
+
+    const tdoas = channelTDOA[chIdx];
+    if (!tdoas || tdoas.length === 0) return;
+
+    const sx = SCOPE_START_X;
+    const yb = rowBottom(chIdx);
+    const yh = scopeH();
+
+    // Master peak — from quality data (JSON fields: snr_db, peak_bin)
+    const q = channelQuality[chIdx];
+    if (q && q.snr_db >= SNR_WARN && q.peak_bin > 0) {
+        const x = sx + q.peak_bin;
+        if (x >= sx && x < scopeWidth) {
+            drawTickMark(x, yb, yh, STATION_COLORS[0], null);
+        }
+    }
+
+    // Secondary peaks — from TDOA measurements
+    // TDOAMeasurement JSON fields: snr_db (secondary SNR), peak_bin (secondary peak bucket)
+    tdoas.forEach((m, i) => {
+        if (!m.valid) return;
+        if ((m.snr_db || 0) < SNR_WARN) return;
+        if (!m.peak_bin || m.peak_bin <= 0) return;
+
+        const x = sx + m.peak_bin;
+        if (x < sx || x >= scopeWidth) return;
+
+        const color = STATION_COLORS[(i + 1) % STATION_COLORS.length];
+        const label = m.tdoa_us !== undefined
+            ? (m.tdoa_us >= 0 ? '+' : '') + m.tdoa_us.toFixed(1) + 'µs'
+            : null;
+        drawTickMark(x, yb, yh, color, label);
+    });
+}
+
+/**
+ * Draw a vertical tick mark at canvas x position.
+ * @param {number} x       - canvas x coordinate
+ * @param {number} yb      - row bottom y (trace baseline)
+ * @param {number} yh      - row height (trace area)
+ * @param {string} color   - CSS colour string
+ * @param {string|null} label - optional text label above tick
+ */
+function drawTickMark(x, yb, yh, color, label) {
+    ctx.save();
+    ctx.globalAlpha = 0.85;
+    ctx.strokeStyle = color;
+    ctx.lineWidth   = 1.5;
+    ctx.setLineDash([3, 2]);
+    ctx.beginPath();
+    ctx.moveTo(x + 0.5, yb);
+    ctx.lineTo(x + 0.5, yb - yh + 4);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Small triangle at baseline
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 1.0;
+    ctx.beginPath();
+    ctx.moveTo(x - 3, yb);
+    ctx.lineTo(x + 3, yb);
+    ctx.lineTo(x,     yb - 6);
+    ctx.closePath();
+    ctx.fill();
+
+    // Label
+    if (label) {
+        ctx.font = '8px "Inter", system-ui, sans-serif';
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.9;
+        const tw = ctx.measureText(label).width;
+        // Position label to the right, or left if near right edge
+        const lx = (x + tw + 4 < scopeWidth) ? x + 3 : x - tw - 3;
+        ctx.fillText(label, lx, yb - yh + 12);
+    }
+
+    ctx.restore();
+}
+
+// ---------------------------------------------------------------------------
+// Drawing — legend (left margin + emission-delay bar)
+// ---------------------------------------------------------------------------
+
 function drawLegend(chIdx) {
     if (!canvas || chIdx >= chains.length) return;
     const chain = chains[chIdx];
@@ -253,6 +474,27 @@ function drawLegend(chIdx) {
     ctx.fillStyle = '#808090';
     ctx.fillText(chain.short[0], 7, yt + 27);
     if (chain.short[1]) ctx.fillText(chain.short[1], 7, yt + 39);
+
+    // ── SNR badge ────────────────────────────────────────────
+    const q = channelQuality[chIdx];
+    if (q && q.snr_db !== undefined) {
+        const snr = q.snr_db;
+        let dotColor;
+        if (snr >= SNR_GOOD)      dotColor = '#22c55e';
+        else if (snr >= SNR_WARN) dotColor = '#f59e0b';
+        else                      dotColor = '#ef4444';
+
+        // Dot
+        ctx.beginPath();
+        ctx.arc(10, yt + 52, 4, 0, Math.PI * 2);
+        ctx.fillStyle = dotColor;
+        ctx.fill();
+
+        // SNR text
+        ctx.font = '9px "Inter", system-ui, sans-serif';
+        ctx.fillStyle = dotColor;
+        ctx.fillText(snr.toFixed(1) + 'dB', 18, yt + 56);
+    }
 
     // ── Emission-delay bar ───────────────────────────────────
     ctx.fillStyle = '#08080c';
