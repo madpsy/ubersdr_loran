@@ -13,6 +13,13 @@ services:
       # WEB_PORT: "6088"
       # Scope update rate in Hz (default: 10, use 1 for KiwiSDR-compatible 1 Hz)
       # UPDATE_HZ: "10"
+      # Averaging algorithm: 0=CMA, 1=EMA (default), 2=IIR
+      # AVG_ALGO: "1"
+      # Averaging parameter (meaning depends on algorithm):
+      #   EMA → decay constant (default: 256, range 1–512; higher = slower/smoother)
+      #   CMA → number of GRI periods to average (default: 8, range 1–32)
+      #   IIR → exponential gain factor (default: 0.2, range 0.0–1.0)
+      # AVG_PARAM: "256"
     networks:
       - sdr-network
     logging:

@@ -94,6 +94,27 @@ function dispatchWsMessage(msg) {
 }
 
 // ---------------------------------------------------------------------------
+// Search-change subscriber list
+// ---------------------------------------------------------------------------
+
+const searchSubscribers = [];
+
+/**
+ * Register a callback to be called whenever the search filter changes.
+ * Called by map.js and tdoa_panel.js.
+ */
+window.loranSearchSubscribe = function (fn) {
+    searchSubscribers.push(fn);
+};
+
+function notifySearchChange() {
+    const term = searchTerm();
+    searchSubscribers.forEach(fn => {
+        try { fn(term); } catch (e) { console.error('search subscriber error', e); }
+    });
+}
+
+// ---------------------------------------------------------------------------
 // Display order — heard channels float to the top, sorted by SNR descending
 // ---------------------------------------------------------------------------
 
@@ -162,12 +183,56 @@ function isChannelHeard(chIdx) {
     return q.snr_db >= SNR_GOOD;
 }
 
+// ---------------------------------------------------------------------------
+// Search filter — driven by #search-input text box
+// ---------------------------------------------------------------------------
+
+// Returns the current normalised search term (lower-case, trimmed).
+function searchTerm() {
+    const el = document.getElementById('search-input');
+    return el ? el.value.trim().toLowerCase() : '';
+}
+
+// Returns true if the chain at chIdx matches the current search term.
+// Matches against: GRI number, chain name, chain short lines, station IDs, station names.
+function isChannelMatchingSearch(chIdx) {
+    const term = searchTerm();
+    if (!term) return true; // empty filter — everything matches
+    if (chIdx >= chains.length) return true;
+    const chain = chains[chIdx];
+    // GRI
+    if (String(chain.gri).includes(term)) return true;
+    // Chain name
+    if ((chain.name || '').toLowerCase().includes(term)) return true;
+    // Short lines
+    if (chain.short) {
+        for (const s of chain.short) {
+            if ((s || '').toLowerCase().includes(term)) return true;
+        }
+    }
+    // Station IDs and names
+    if (chain.stations) {
+        for (const st of chain.stations) {
+            if ((st.id   || '').toLowerCase().includes(term)) return true;
+            if ((st.name || '').toLowerCase().includes(term)) return true;
+        }
+    }
+    return false;
+}
+
+// Expose for map.js / tdoa_panel.js
+window.loranSearchTerm       = searchTerm;
+window.loranIsChainMatch     = isChannelMatchingSearch;
+
 // Overlay a translucent dark rectangle over the entire row (legend + trace)
-// when the "heard only" filter is active and this channel is below threshold.
+// when the "heard only" filter is active and this channel is below threshold,
+// OR when the search filter is active and this channel doesn't match.
 // Must be called AFTER drawScope() and drawPeakMarkers() so it sits on top.
 function applyRowDimOverlay(chIdx) {
     if (!canvas) return;
-    if (heardOnly() && !isChannelHeard(chIdx)) {
+    const dimHeard  = heardOnly() && !isChannelHeard(chIdx);
+    const dimSearch = searchTerm() && !isChannelMatchingSearch(chIdx);
+    if (dimHeard || dimSearch) {
         ctx.fillStyle = '#08080c';
         ctx.globalAlpha = 0.72;
         ctx.fillRect(0, rowTop(chIdx), scopeWidth, ROW_HEIGHT);
@@ -213,6 +278,26 @@ async function bootstrap() {
         const validOnlyCb = document.getElementById('valid-only');
         if (validOnlyCb) {
             validOnlyCb.addEventListener('change', redrawAllLegends);
+        }
+
+        // Wire search filter input — redraw + notify siblings on every keystroke
+        const searchEl = document.getElementById('search-input');
+        const clearBtn = document.getElementById('search-clear');
+        if (searchEl) {
+            searchEl.addEventListener('input', () => {
+                const hasText = searchEl.value.length > 0;
+                if (clearBtn) clearBtn.style.display = hasText ? 'block' : 'none';
+                redrawAllLegends();
+                notifySearchChange();
+            });
+        }
+        if (clearBtn) {
+            clearBtn.addEventListener('click', () => {
+                if (searchEl) searchEl.value = '';
+                clearBtn.style.display = 'none';
+                redrawAllLegends();
+                notifySearchChange();
+            });
         }
 
         connect();

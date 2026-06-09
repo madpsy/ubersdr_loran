@@ -256,6 +256,49 @@
     height: 13px;
   }
 
+  /* ── Search filter ───────────────────────────────────────── */
+  #search-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: #1a1a22;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 3px 10px 3px 8px;
+    transition: border-color 0.2s;
+  }
+  #search-wrap:focus-within {
+    border-color: var(--accent);
+  }
+  #search-wrap svg {
+    flex-shrink: 0;
+    opacity: 0.45;
+  }
+  #search-input {
+    background: transparent;
+    border: none;
+    outline: none;
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 11px;
+    width: 140px;
+    caret-color: var(--accent);
+  }
+  #search-input::placeholder {
+    color: var(--muted);
+  }
+  #search-clear {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 13px;
+    line-height: 1;
+    padding: 0;
+    display: none;
+  }
+  #search-clear:hover { color: var(--text); }
+
   #tdoa-panel {
     overflow-x: auto;
   }
@@ -344,6 +387,14 @@
   <div class="header-text">
     <h1>Loran-C Viewer</h1>
     <p>100 kHz pulse-envelope scope — 14 chains simultaneously</p>
+  </div>
+  <div id="search-wrap" title="Filter by chain name, station name, GRI or station ID">
+    <svg width="12" height="12" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+      <circle cx="6.5" cy="6.5" r="5" stroke="#e2e2e8" stroke-width="1.5"/>
+      <line x1="10.5" y1="10.5" x2="14.5" y2="14.5" stroke="#e2e2e8" stroke-width="1.5" stroke-linecap="round"/>
+    </svg>
+    <input type="text" id="search-input" placeholder="Filter chains…" autocomplete="off" spellcheck="false">
+    <button id="search-clear" title="Clear filter">✕</button>
   </div>
   <label id="valid-only-label" title="Show only stations we can hear (SNR ≥ 15 dB)">
     <input type="checkbox" id="valid-only"> Heard only

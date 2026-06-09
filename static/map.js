@@ -74,21 +74,51 @@ function heardOnly() {
     return cb ? cb.checked : false;
 }
 
-// Apply/remove the "heard only" filter to transmitter markers.
+// Fit the map view to all currently-visible (non-dimmed) transmitter markers.
+// Called after any filter change so the map always shows the relevant stations.
+// If no markers are visible, does nothing.
+function fitVisibleMarkers() {
+    if (!map) return;
+    const latlngs = [];
+    Object.entries(txMarkers).forEach(([key, marker]) => {
+        // A marker is "visible" if its opacity is not the ghost value (0.12)
+        const opts = marker.options;
+        if (opts.opacity > 0.12) {
+            latlngs.push(marker.getLatLng());
+        }
+    });
+    // Also include receiver marker if present
+    if (window._rxMarkerLatLng) latlngs.push(window._rxMarkerLatLng);
+    if (latlngs.length === 0) return;
+    if (latlngs.length === 1) {
+        map.setView(latlngs[0], Math.max(map.getZoom(), 5));
+        return;
+    }
+    map.fitBounds(L.latLngBounds(latlngs), { padding: [40, 40], maxZoom: 8 });
+}
+
+// Apply/remove the "heard only" and search filters to transmitter markers,
+// then fit the map to the visible markers.
 // A chain is "heard" if heardGRIs contains its GRI.
 function applyHeardFilter() {
-    const filter = heardOnly();
+    const filterHeard  = heardOnly();
     const chains = window.loranChains;
     if (!chains) return;
 
-    chains.forEach(chain => {
+    chains.forEach((chain, chIdx) => {
         const heard = heardGRIs.has(chain.gri);
+        // Search filter: use loran_c.js helper if available
+        const matchesSearch = (typeof window.loranIsChainMatch === 'function')
+            ? window.loranIsChainMatch(chIdx)
+            : true;
+        const dim = (filterHeard && !heard) || !matchesSearch;
+
         if (!chain.stations) return;
         chain.stations.forEach((st, stIdx) => {
             const key = chain.gri + '_' + st.id;
             const marker = txMarkers[key];
             if (!marker) return;
-            if (filter && !heard) {
+            if (dim) {
                 marker.setStyle({ opacity: 0.12, fillOpacity: 0.06 });
                 // Hide the permanent tooltip so it doesn't float over a ghost marker
                 marker.closeTooltip();
@@ -108,6 +138,9 @@ function applyHeardFilter() {
     if (latestLops !== null) {
         updateLOPs(latestLops, window.loranChains, window.loranTraceColors);
     }
+
+    // Fit map to visible markers after filter change
+    fitVisibleMarkers();
 }
 
 function initMap() {
@@ -132,6 +165,11 @@ function initMap() {
     // Wire "heard only" checkbox
     const cb = document.getElementById('valid-only');
     if (cb) cb.addEventListener('change', applyHeardFilter);
+
+    // Wire search filter — re-apply marker visibility on every keystroke
+    if (typeof window.loranSearchSubscribe === 'function') {
+        window.loranSearchSubscribe(() => applyHeardFilter());
+    }
 
     // Subscribe to WS JSON messages
     if (typeof window.loranWsSubscribe === 'function') {
@@ -234,6 +272,9 @@ function placeTransmitterMarkers(chains, traceColors) {
             txMarkers[key] = marker;
         });
     });
+
+    // Fit map to all transmitter markers on initial placement
+    fitVisibleMarkers();
 }
 
 // ---------------------------------------------------------------------------
@@ -274,6 +315,9 @@ function setReceiverPos(lat, lon) {
     rxLat = lat;
     rxLon = lon;
 
+    // Store for fitVisibleMarkers
+    window._rxMarkerLatLng = L.latLng(lat, lon);
+
     if (rxMarker) {
         rxMarker.setLatLng([lat, lon]);
         rxMarker.setTooltipContent(buildRxTooltip(lat, lon));
@@ -291,8 +335,8 @@ function setReceiverPos(lat, lon) {
             { direction: 'top', offset: [0, -8], permanent: false }
         );
 
-        // Pan to receiver on first placement
-        map.setView([lat, lon], 5, { animate: true });
+        // Fit to all visible markers (transmitters + receiver) on first placement
+        fitVisibleMarkers();
     }
 
     // Redraw error line if fix is already known

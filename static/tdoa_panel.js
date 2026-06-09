@@ -111,11 +111,27 @@ function renderTable(measurements) {
     }
 
     // Optionally filter to only heard (valid) measurements
-    const filtered = heardOnly() ? measurements.filter(m => m.valid) : measurements;
+    let filtered = heardOnly() ? measurements.filter(m => m.valid) : measurements;
+
+    // Apply search filter — match against chain name, GRI, station ID/name
+    const term = (typeof window.loranSearchTerm === 'function') ? window.loranSearchTerm() : '';
+    if (term) {
+        filtered = filtered.filter(m => {
+            const chains = window.loranChains;
+            if (!chains) return true;
+            const idx = chains.findIndex(c => c.gri === m.chain_gri);
+            if (idx < 0) return true;
+            if (typeof window.loranIsChainMatch === 'function') {
+                return window.loranIsChainMatch(idx);
+            }
+            return true;
+        });
+    }
 
     if (filtered.length === 0) {
+        const msg = term ? 'No matching stations…' : 'No heard stations yet…';
         tbody.innerHTML = '<tr><td colspan="6" class="val-muted" ' +
-            'style="padding:12px 10px;text-align:center">No heard stations yet…</td></tr>';
+            `style="padding:12px 10px;text-align:center">${msg}</td></tr>`;
         return;
     }
 
@@ -212,6 +228,11 @@ window.tdoaPanelInit = function () {
     const cb = document.getElementById('valid-only');
     if (cb) {
         cb.addEventListener('change', () => renderTable(latestTDOA));
+    }
+
+    // Re-render table when the search filter changes
+    if (typeof window.loranSearchSubscribe === 'function') {
+        window.loranSearchSubscribe(() => renderTable(latestTDOA));
     }
 
     // Subscribe to WS messages — all data arrives via push, no REST polling

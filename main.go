@@ -306,6 +306,8 @@ type client struct {
 	running       bool
 	server        *ScopeServer
 	updateHz      int
+	avgAlgo       int     // averaging algorithm: 0=CMA, 1=EMA, 2=IIR
+	avgParam      float64 // averaging parameter (meaning depends on algorithm)
 }
 
 func (c *client) httpBase() string {
@@ -488,6 +490,8 @@ func (c *client) runOnce() (reconnect bool) {
 						gri = 5990
 					}
 					loranDec.SetGRI(chIdx, gri)
+					loranDec.SetAvgAlgo(chIdx, c.avgAlgo)
+					loranDec.SetAvgParam(chIdx, c.avgParam)
 				}
 				loranDec.Start()
 				tdoaEng = NewTDOAEngine(loranDec)
@@ -590,6 +594,8 @@ func main() {
 		webStatic = flag.String("web-static", "./static", "Path to static web files directory")
 		updateHz  = flag.Int("update-hz", 10, "Scope update rate in Hz (1=KiwiSDR-compatible, 10=default, max ~25)")
 		noReconn  = flag.Bool("no-reconnect", false, "Disable auto-reconnect on disconnect")
+		avgAlgo   = flag.Int("avg-algo", avgEMA, "Averaging algorithm: 0=CMA, 1=EMA (default), 2=IIR")
+		avgParam  = flag.Float64("avg-param", 256, "Averaging parameter (EMA: decay 1-512, CMA: periods 1-32, IIR: exp 0.0-1.0)")
 	)
 	flag.Parse()
 
@@ -630,6 +636,8 @@ func main() {
 		running:       true,
 		server:        server,
 		updateHz:      *updateHz,
+		avgAlgo:       *avgAlgo,
+		avgParam:      *avgParam,
 	}
 
 	// Handle SIGINT / SIGTERM gracefully.
