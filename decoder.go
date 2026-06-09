@@ -250,6 +250,17 @@ func (d *LoranDecoder) MsPerBin() float64 {
 func (d *LoranDecoder) ProcessSamples(samples []int16, fn func(ch int, cmd byte, payload []byte)) {
 	nSamps := len(samples) / 2 // each IQ pair is 2 × int16
 
+	// Collect any scope frames to emit after releasing the lock.
+	// This avoids holding d.mu while calling fn (which broadcasts to WebSocket clients).
+	type pendingFrame struct {
+		ch      int
+		cmd     byte
+		payload []byte
+	}
+	var pending []pendingFrame
+
+	d.mu.Lock()
+
 	for i := 0; i < nSamps; i++ {
 		// float re = (float) samps[i].re;
 		// float im = (float) samps[i].im;
@@ -257,8 +268,6 @@ func (d *LoranDecoder) ProcessSamples(samples []int16, fn func(ch int, cmd byte,
 		re := float32(samples[i*2])
 		im := float32(samples[i*2+1])
 		pwr := re*re + im*im
-
-		d.mu.Lock()
 
 		for ch := 0; ch < nch; ch++ {
 			c := &d.ch[ch]
@@ -325,9 +334,7 @@ func (d *LoranDecoder) ProcessSamples(samples []int16, fn func(ch int, cmd byte,
 					d.redrawLegend = false
 				}
 
-				d.mu.Unlock()
-				fn(ch, cmd, payload)
-				d.mu.Lock()
+				pending = append(pending, pendingFrame{ch: ch, cmd: cmd, payload: payload})
 			}
 
 			// c->dsp_samps++;  (always, after the scope-send block)
@@ -412,7 +419,13 @@ func (d *LoranDecoder) ProcessSamples(samples []int16, fn func(ch int, cmd byte,
 			// c->samp++;
 			c.samp++
 		}
+	}
 
-		d.mu.Unlock()
+	d.mu.Unlock()
+
+	// Emit pending scope frames outside the lock so WebSocket sends don't
+	// block the decoder.
+	for _, f := range pending {
+		fn(f.ch, f.cmd, f.payload)
 	}
 }
