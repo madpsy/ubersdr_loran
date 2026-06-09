@@ -379,14 +379,39 @@ func ComputeFix(measurements []TDOAMeasurement, initialPos LatLon, propSpeedKmS 
 		return PositionFix{Valid: false, UpdatedAt: time.Now()}
 	}
 
-	// Gauss-Newton iteration.
+	// Levenberg-Marquardt damped Gauss-Newton iteration.
 	// State vector: [lat (deg), lon (deg)]
+	// Damping prevents divergence when the initial estimate is far from the solution.
 	lat := initialPos.Lat
 	lon := initialPos.Lon
+	lambda := 1.0 // LM damping factor (increases on divergence, decreases on improvement)
+
+	// Numerical Jacobian step sizes: 100 m in each direction.
+	// Small enough for accurate derivatives, large enough to avoid floating-point noise.
+	const stepLatDeg = 100.0 / 111320.0 // 100 m in degrees latitude
+	const maxStepKm = 200.0             // clamp each iteration step to 200 km
+
+	computeCost := func(la, lo float64) float64 {
+		p := LatLon{Lat: la, Lon: lo}
+		var s float64
+		for _, ob := range observations {
+			dM := vincentyDistKm(p, ob.master)
+			dS := vincentyDistKm(p, ob.secondary)
+			r := ob.rangeDiff - (dM - dS)
+			s += r * r
+		}
+		return s
+	}
 
 	var iter int
 	for iter = 0; iter < maxIter; iter++ {
 		p := LatLon{Lat: lat, Lon: lon}
+
+		cosLat := math.Cos(lat * math.Pi / 180)
+		if math.Abs(cosLat) < 1e-6 {
+			cosLat = 1e-6
+		}
+		stepLonDeg := 100.0 / (111320.0 * cosLat)
 
 		// Build Jacobian J (n×2) and residual vector r (n×1).
 		n := len(observations)
@@ -399,27 +424,20 @@ func ComputeFix(measurements []TDOAMeasurement, initialPos LatLon, propSpeedKmS 
 			predicted := dM - dS
 			res[i] = ob.rangeDiff - predicted
 
-			// Numerical Jacobian: partial derivatives w.r.t. lat and lon.
-			// Step size: ~1 m in each direction.
-			dLat := 1.0 / 111.32 // 1 m in degrees latitude
-			dLon := 1.0 / (111.32 * math.Cos(lat*math.Pi/180))
+			// Forward-difference numerical Jacobian.
+			pLat := LatLon{Lat: lat + stepLatDeg, Lon: lon}
+			pLon := LatLon{Lat: lat, Lon: lon + stepLonDeg}
 
-			pLat := LatLon{Lat: lat + dLat, Lon: lon}
-			pLon := LatLon{Lat: lat, Lon: lon + dLon}
-
-			dMlat := vincentyDistKm(pLat, ob.master)
-			dSlat := vincentyDistKm(pLat, ob.secondary)
-			dMlon := vincentyDistKm(pLon, ob.master)
-			dSlon := vincentyDistKm(pLon, ob.secondary)
+			fLat := vincentyDistKm(pLat, ob.master) - vincentyDistKm(pLat, ob.secondary)
+			fLon := vincentyDistKm(pLon, ob.master) - vincentyDistKm(pLon, ob.secondary)
 
 			J[i] = []float64{
-				(dMlat - dSlat - predicted) / dLat,
-				(dMlon - dSlon - predicted) / dLon,
+				(fLat - predicted) / stepLatDeg,
+				(fLon - predicted) / stepLonDeg,
 			}
 		}
 
-		// Solve normal equations: (JᵀJ) δ = Jᵀ r
-		// 2×2 system — solve analytically.
+		// Build normal equations: (JᵀJ + λI) δ = Jᵀ r
 		var JtJ [2][2]float64
 		var Jtr [2]float64
 		for i := 0; i < n; i++ {
@@ -431,20 +449,63 @@ func ComputeFix(measurements []TDOAMeasurement, initialPos LatLon, propSpeedKmS 
 			Jtr[1] += J[i][1] * res[i]
 		}
 
+		// Apply LM damping to diagonal.
+		JtJ[0][0] += lambda
+		JtJ[1][1] += lambda
+
 		det := JtJ[0][0]*JtJ[1][1] - JtJ[0][1]*JtJ[1][0]
-		if math.Abs(det) < 1e-20 {
-			break // singular — stop iterating
+		if math.Abs(det) < 1e-30 {
+			break // singular — stop
 		}
 
 		δLat := (JtJ[1][1]*Jtr[0] - JtJ[0][1]*Jtr[1]) / det
 		δLon := (JtJ[0][0]*Jtr[1] - JtJ[1][0]*Jtr[0]) / det
 
-		lat += δLat
-		lon += δLon
+		// Clamp step to maxStepKm to prevent wild divergence.
+		stepKm := math.Sqrt((δLat*111.32)*(δLat*111.32) + (δLon*111.32*cosLat)*(δLon*111.32*cosLat))
+		if stepKm > maxStepKm {
+			scale := maxStepKm / stepKm
+			δLat *= scale
+			δLon *= scale
+			stepKm = maxStepKm
+		}
 
-		// Convergence check: step < 1 m.
-		stepKm := math.Sqrt(δLat*δLat*111.32*111.32 + δLon*δLon*111.32*111.32)
-		if stepKm < 0.001 {
+		newLat := lat + δLat
+		newLon := lon + δLon
+
+		// Clamp to valid geodetic bounds.
+		if newLat < -89.9 {
+			newLat = -89.9
+		}
+		if newLat > 89.9 {
+			newLat = 89.9
+		}
+		for newLon < -180 {
+			newLon += 360
+		}
+		for newLon > 180 {
+			newLon -= 360
+		}
+
+		// LM update: accept step only if cost decreases.
+		oldCost := computeCost(lat, lon)
+		newCost := computeCost(newLat, newLon)
+		if newCost < oldCost {
+			lat = newLat
+			lon = newLon
+			lambda *= 0.5 // reduce damping — getting closer
+			if lambda < 1e-7 {
+				lambda = 1e-7
+			}
+		} else {
+			lambda *= 4.0 // increase damping — step was bad
+			if lambda > 1e8 {
+				break
+			} // fully damped — give up
+		}
+
+		// Convergence check: step < 10 m.
+		if stepKm < 0.01 {
 			iter++
 			break
 		}

@@ -98,30 +98,22 @@ function rowBottom(i) { return (i + 1) * ROW_HEIGHT - H_LEGEND; }
 function scopeH()     { return ROW_HEIGHT - H_LEGEND; }
 
 // ---------------------------------------------------------------------------
-// UTC clock — polls GET /api/timing and updates #utc-time in the header.
-// The server returns the PCM wall-clock timestamp (NTP ±1–10 ms).
-// Between polls the display is advanced by a local JS timer so it ticks
-// smoothly every second without hammering the API.
+// UTC clock — driven by timing_update WS messages from the server.
+// Between WS pushes the display is advanced by a local JS timer so it ticks
+// smoothly every 100 ms without any REST polling.
 // ---------------------------------------------------------------------------
 
-const TIMING_POLL_MS = 5000; // REST poll interval (rate-limit friendly)
+let utcOffsetMs = 0;      // difference: server UTC ms - Date.now() at last push
+let utcValid    = false;  // true once first timing_update arrives
+let utcTicker   = null;   // setInterval handle for the display tick
 
-let utcOffsetMs = 0;      // difference: server UTC ms - Date.now() at last poll
-let utcValid    = false;  // true once first timing poll succeeds
-let utcTicker   = null;   // setInterval handle for the 1-second display tick
-
-async function pollTiming() {
-    try {
-        const resp = await fetch(BASE_PATH + '/api/timing');
-        if (!resp.ok) return;
-        const data = await resp.json();
-        if (!data.valid) return;
-        // data.utc is RFC3339, e.g. "2026-06-09T11:45:00.123Z"
-        const serverMs = new Date(data.utc).getTime();
-        utcOffsetMs = serverMs - Date.now();
-        utcValid    = true;
-        updateUtcDisplay();
-    } catch (e) { /* ignore */ }
+function applyTimingUpdate(data) {
+    if (!data.valid) return;
+    // data.utc is RFC3339, e.g. "2026-06-09T11:45:00.123Z"
+    const serverMs = new Date(data.utc).getTime();
+    utcOffsetMs = serverMs - Date.now();
+    utcValid    = true;
+    updateUtcDisplay();
 }
 
 function updateUtcDisplay() {
@@ -137,39 +129,9 @@ function updateUtcDisplay() {
 }
 
 function startUtcClock() {
-    pollTiming();
-    setInterval(pollTiming, TIMING_POLL_MS);
-    // Tick the display every 100 ms for smooth millisecond updates
+    // Tick the display every 100 ms for smooth millisecond updates.
+    // Actual time sync comes from timing_update WS messages.
     utcTicker = setInterval(updateUtcDisplay, 100);
-}
-
-// ---------------------------------------------------------------------------
-// Quality polling — keeps SNR badges fresh (server may not push quality_update)
-// Polled at 5 s to stay well within the UberSDR reverse-proxy rate limit.
-// ---------------------------------------------------------------------------
-
-const QUALITY_POLL_MS = 5000;
-
-async function pollQuality() {
-    if (NCH === 0) return; // not yet bootstrapped
-    try {
-        const resp = await fetch(BASE_PATH + '/api/quality');
-        if (!resp.ok) return;
-        const data = await resp.json();
-        // Response shape: {channels: ChannelQuality[], wall_clock_ms: ...}
-        const channels = data.channels || data;
-        if (!Array.isArray(channels)) return;
-        let changed = false;
-        channels.forEach(q => {
-            if (q.ch_idx !== undefined) {
-                channelQuality[q.ch_idx] = q;
-                changed = true;
-            }
-        });
-        if (changed) {
-            for (let i = 0; i < NCH; i++) drawLegend(i);
-        }
-    } catch (e) { /* ignore */ }
 }
 
 // ---------------------------------------------------------------------------
@@ -201,12 +163,8 @@ async function bootstrap() {
 
         connect();
 
-        // Start UTC clock display
+        // Start UTC clock display (ticks locally; synced via timing_update WS push)
         startUtcClock();
-
-        // Poll quality endpoint to keep SNR badges fresh
-        pollQuality();
-        setInterval(pollQuality, QUALITY_POLL_MS);
 
         // Initialise sibling modules after chains are available
         if (typeof window.mapInit === 'function') {
@@ -278,6 +236,10 @@ function handleJsonMessage(msg) {
         case 'ms_per_bin':
             msPerBin = parseFloat(msg.ms_per_bin);
             for (let i = 0; i < NCH; i++) drawLegend(i);
+            break;
+
+        case 'timing_update':
+            applyTimingUpdate(msg);
             break;
 
         case 'quality_update': {

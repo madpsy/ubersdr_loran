@@ -1,9 +1,9 @@
 // tdoa_panel.js — TDOA / signal-quality table for ubersdr_loran
 //
 // Populates #tdoa-tbody with one row per active TDOA measurement pair.
-// Data sources:
-//   • GET /api/tdoa    — polled at 1 Hz, returns TDOAMeasurement[]
-//   • GET /api/quality — polled at 1 Hz, returns {channels: ChannelQuality[], wall_clock_ms}
+// Data arrives via WebSocket push messages (no REST polling):
+//   • tdoa_update   — {type, measurements: TDOAMeasurement[]}
+//   • quality_update — {type, channels: ChannelQuality[], wall_clock_ms}
 //
 // TDOAMeasurement JSON fields (from tdoa.go):
 //   chain_gri, chain_name, master_id, secondary_id,
@@ -13,7 +13,6 @@
 //   ch_idx, gri, peak_bin, peak_pwr, noise_pwr, snr_db, navgs
 //
 // Depends on:
-//   • window.BASE_PATH
 //   • window.loranChains  (set by loran_c.js after bootstrap)
 //   • window.loranTraceColors
 //   • window.loranWsSubscribe(fn)
@@ -21,12 +20,6 @@
 'use strict';
 
 (function () {
-
-const BASE_PATH = (typeof window.BASE_PATH === 'string') ? window.BASE_PATH : '';
-
-// Poll interval (ms).
-// Kept at 5 s to stay within the UberSDR reverse-proxy rate limit.
-const POLL_MS = 5000;
 
 // SNR thresholds (dB)
 const SNR_GOOD = 15;
@@ -166,41 +159,7 @@ function escHtml(s) {
 }
 
 // ---------------------------------------------------------------------------
-// Poll REST endpoints
-// ---------------------------------------------------------------------------
-
-async function poll() {
-    try {
-        const [tdoaResp, qualResp] = await Promise.all([
-            fetch(BASE_PATH + '/api/tdoa'),
-            fetch(BASE_PATH + '/api/quality'),
-        ]);
-
-        if (tdoaResp.ok) {
-            const data = await tdoaResp.json();
-            // /api/tdoa returns a TDOAMeasurement[] directly
-            latestTDOA = Array.isArray(data) ? data : [];
-        }
-
-        if (qualResp.ok) {
-            const data = await qualResp.json();
-            // /api/quality returns {channels: ChannelQuality[], wall_clock_ms: ...}
-            const channels = data.channels || data; // handle both shapes
-            if (Array.isArray(channels)) {
-                channels.forEach(q => {
-                    if (q.ch_idx !== undefined) qualityMap[q.ch_idx] = q;
-                });
-            }
-        }
-
-        renderTable(latestTDOA);
-    } catch (e) {
-        // Network error — silently ignore, will retry
-    }
-}
-
-// ---------------------------------------------------------------------------
-// WebSocket message handler (future: server may push these)
+// WebSocket message handler
 // ---------------------------------------------------------------------------
 
 function onWsMessage(msg) {
@@ -229,7 +188,7 @@ function onWsMessage(msg) {
 // ---------------------------------------------------------------------------
 
 window.tdoaPanelInit = function () {
-    // Subscribe to WS messages
+    // Subscribe to WS messages — all data arrives via push, no REST polling
     if (typeof window.loranWsSubscribe === 'function') {
         window.loranWsSubscribe(onWsMessage);
     } else {
@@ -239,10 +198,6 @@ window.tdoaPanelInit = function () {
             }
         }, 2000);
     }
-
-    // Start polling
-    poll();
-    setInterval(poll, POLL_MS);
 };
 
 })();

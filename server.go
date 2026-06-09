@@ -29,6 +29,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"text/template"
+	"time"
 	"unsafe"
 
 	"github.com/gorilla/websocket"
@@ -103,6 +104,11 @@ type ScopeServer struct {
 	mux *http.ServeMux
 }
 
+// pushInterval is how often the server pushes quality/tdoa/lops/fix/timing
+// over the WebSocket to all connected clients.  5 s is well within the
+// UberSDR reverse-proxy rate limit (which only applies to REST calls).
+const pushInterval = 5 * time.Second
+
 // NewScopeServer creates a new ScopeServer serving static files from staticDir.
 // iqMode is the IQ mode string (e.g. "iq", "iq48") — used in /api/config.
 // The actual sample rate is determined lazily from the first PCM packet.
@@ -131,6 +137,11 @@ func NewScopeServer(staticDir string, iqMode string, updateHz int) *ScopeServer 
 	s.mux.HandleFunc("/api/timing", s.handleAPITiming)
 	s.mux.HandleFunc("/api/receiver", s.handleAPIReceiver)
 	s.mux.HandleFunc("/", s.handleHTTP)
+
+	// Start background goroutine that pushes live data over WS so the
+	// frontend never needs to poll the REST endpoints.
+	go s.runPushLoop()
+
 	return s
 }
 
@@ -214,6 +225,122 @@ func (s *ScopeServer) SetReceiverPos(lat, lon float64) {
 // SetWallClockMs stores the most recent wall-clock timestamp from the PCM header.
 func (s *ScopeServer) SetWallClockMs(ms uint64) {
 	atomic.StoreUint64(&s.wallClockMs, ms)
+}
+
+// ---------------------------------------------------------------------------
+// WS push loop — broadcasts live data to all clients every pushInterval.
+// This eliminates the need for the frontend to poll REST endpoints, which
+// would trigger the UberSDR reverse-proxy rate limiter.
+// ---------------------------------------------------------------------------
+
+// buildPushFrames assembles all live-data JSON messages to broadcast.
+// Returns nil slices for data that is not yet available.
+func (s *ScopeServer) buildPushFrames() [][]byte {
+	var frames [][]byte
+
+	// quality_update
+	s.decoderMu.RLock()
+	d := s.decoder
+	s.decoderMu.RUnlock()
+	if d != nil {
+		channels := make([]ChannelQuality, nch)
+		for i := 0; i < nch; i++ {
+			channels[i] = d.Quality(i)
+		}
+		if b, err := json.Marshal(map[string]interface{}{
+			"type":          "quality_update",
+			"channels":      channels,
+			"wall_clock_ms": atomic.LoadUint64(&s.wallClockMs),
+		}); err == nil {
+			frames = append(frames, b)
+		}
+	}
+
+	// tdoa_update
+	s.tdoaMu.RLock()
+	tdoaEng := s.tdoaEng
+	s.tdoaMu.RUnlock()
+	if tdoaEng != nil {
+		results := tdoaEng.Results()
+		if b, err := json.Marshal(map[string]interface{}{
+			"type":         "tdoa_update",
+			"measurements": results,
+		}); err == nil {
+			frames = append(frames, b)
+		}
+	}
+
+	// lop_update + fix_update
+	s.lopMu.RLock()
+	lopEng := s.lopEng
+	s.lopMu.RUnlock()
+	if lopEng != nil {
+		lops := lopEng.LOPs()
+		if b, err := json.Marshal(map[string]interface{}{
+			"type": "lop_update",
+			"lops": lops,
+		}); err == nil {
+			frames = append(frames, b)
+		}
+	}
+
+	// fix_update — computed on demand from latest TDOA measurements
+	if tdoaEng != nil {
+		s.receiverPos.mu.RLock()
+		initialPos := LatLon{Lat: s.receiverPos.lat, Lon: s.receiverPos.lon}
+		s.receiverPos.mu.RUnlock()
+		if initialPos.Lat == 0 && initialPos.Lon == 0 {
+			initialPos = LatLon{Lat: 51.5, Lon: 0.0}
+		}
+		measurements := tdoaEng.Results()
+		fix := ComputeFix(measurements, initialPos, loranPropSpeedKmS, 20)
+		if b, err := json.Marshal(map[string]interface{}{
+			"type": "fix_update",
+			"fix":  fix,
+		}); err == nil {
+			frames = append(frames, b)
+		}
+	}
+
+	// timing_update
+	info := s.GetTimingInfo()
+	if info.Valid {
+		if b, err := json.Marshal(map[string]interface{}{
+			"type":  "timing_update",
+			"valid": info.Valid,
+			"utc":   info.UTC,
+		}); err == nil {
+			frames = append(frames, b)
+		}
+	}
+
+	return frames
+}
+
+// runPushLoop broadcasts live data to all connected WS clients every pushInterval.
+func (s *ScopeServer) runPushLoop() {
+	ticker := time.NewTicker(pushInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		frames := s.buildPushFrames()
+		for _, b := range frames {
+			s.broadcastText(b)
+		}
+	}
+}
+
+// sendPushSnapshot sends the current live-data snapshot to a single newly
+// connected client (so it gets data immediately without waiting for the
+// first tick).
+func (s *ScopeServer) sendPushSnapshot(conn interface{ WriteMessage(int, []byte) error }) {
+	frames := s.buildPushFrames()
+	for _, b := range frames {
+		frame := make([]byte, 1+len(b))
+		frame[0] = 0xFF
+		copy(frame[1:], b)
+		// Write directly — client is not yet in the send queue.
+		conn.WriteMessage(websocket.TextMessage, b) //nolint:errcheck
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +436,10 @@ func (s *ScopeServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		b, _ := json.Marshal(msg)
 		conn.WriteMessage(websocket.TextMessage, b) //nolint:errcheck
 	}
+
+	// Send current live-data snapshot immediately so the new client
+	// doesn't have to wait up to pushInterval for the first update.
+	s.sendPushSnapshot(conn)
 
 	// Write pump — sends queued frames to the browser.
 	go func() {

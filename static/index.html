@@ -229,6 +229,20 @@
   .leaflet-popup-tip { background: var(--surface); }
   .leaflet-popup-content { font-size: 12px; line-height: 1.6; }
 
+  /* Permanent station-name labels */
+  .tx-label {
+    background: rgba(10,10,18,0.78);
+    border: 1px solid rgba(255,255,255,0.12);
+    border-radius: 3px;
+    color: #d0d0e0;
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 5px;
+    white-space: nowrap;
+    box-shadow: none;
+  }
+  .tx-label::before { display: none; } /* hide the tooltip arrow */
+
   /* ── TDOA / Quality panel ────────────────────────────────── */
   #tdoa-card {
     background: var(--surface);

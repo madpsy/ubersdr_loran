@@ -1,10 +1,10 @@
 // map.js — Leaflet map panel for ubersdr_loran
 //
 // Displays:
-//   • Transmitter CircleMarkers (loaded from /api/chains)
+//   • Transmitter CircleMarkers (loaded from /api/chains at bootstrap)
 //   • Receiver CircleMarker (from receiver_pos WS message)
-//   • LOP polylines (from /api/lops, polled 1 Hz)
-//   • Position fix marker (from /api/fix, polled 1 Hz)
+//   • LOP polylines (from lop_update WS push)
+//   • Position fix marker (from fix_update WS push)
 //
 // Depends on:
 //   • Leaflet.js (loaded before this script in index.html)
@@ -29,10 +29,6 @@ const TILE_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">Open
 
 // Station colour palette (matches loran_c.js STATION_COLORS)
 const STATION_COLORS = ['#e74c3c', '#f1c40f', '#2ecc71', '#3498db', '#95a5a6'];
-
-// Poll interval for REST endpoints (ms).
-// Kept at 5 s to stay within the UberSDR reverse-proxy rate limit.
-const POLL_MS = 5000;
 
 // ---------------------------------------------------------------------------
 // State
@@ -83,10 +79,6 @@ function initMap() {
     // Fetch receiver position immediately (may also arrive via WS receiver_pos)
     fetchReceiverPos();
 
-    // Start polling REST endpoints
-    pollLOPs();
-    setInterval(pollLOPs, POLL_MS);
-
     // Subscribe to WS JSON messages
     if (typeof window.loranWsSubscribe === 'function') {
         window.loranWsSubscribe(onWsMessage);
@@ -127,10 +119,8 @@ function placeTransmitterMarkers(chains, traceColors) {
             }).addTo(map);
 
             marker.bindTooltip(
-                `<b>${st.id} ${st.name}</b><br>` +
-                `GRI ${chain.gri} — ${chain.name}<br>` +
-                `${st.lat.toFixed(4)}°, ${st.lon.toFixed(4)}°`,
-                { direction: 'top', offset: [0, -6] }
+                `<b>${st.id}</b> ${st.name}`,
+                { direction: 'top', offset: [0, -8], permanent: true, className: 'tx-label' }
             );
 
             txMarkers[key] = marker;
@@ -377,54 +367,24 @@ function updateFix(fix) {
 }
 
 function buildFixPopup(fix, errKm) {
-    const residStr = fix.residual_us !== undefined
-        ? fix.residual_us.toFixed(1) + ' µs'
-        : '?';
-    const hdopStr = fix.hdop !== undefined
-        ? fix.hdop.toFixed(2)
+    const residStr = fix.rms_km !== undefined
+        ? (fix.rms_km < 1
+            ? (fix.rms_km * 1000).toFixed(0) + ' m RMS'
+            : fix.rms_km.toFixed(3) + ' km RMS')
         : '?';
     const errStr = errKm !== null && errKm !== undefined
         ? (errKm < 1
             ? (errKm * 1000).toFixed(0) + ' m'
             : errKm.toFixed(2) + ' km')
         : '?';
+    const iterStr = fix.iterations !== undefined ? fix.iterations : '?';
     return `<b>🟢 Loran fix</b><br>` +
            `Lat: ${fix.lat.toFixed(5)}°<br>` +
            `Lon: ${fix.lon.toFixed(5)}°<br>` +
            `Error vs known: <b>${errStr}</b><br>` +
            `Residual: ${residStr}<br>` +
-           `HDOP: ${hdopStr}<br>` +
-           `LOPs used: ${fix.n_lops || '?'}`;
-}
-
-// ---------------------------------------------------------------------------
-// Poll REST endpoints
-// ---------------------------------------------------------------------------
-
-async function pollLOPs() {
-    if (!map) return;
-
-    const chains     = window.loranChains;
-    const traceColors = window.loranTraceColors;
-
-    try {
-        const [lopsResp, fixResp] = await Promise.all([
-            fetch(BASE_PATH + '/api/lops'),
-            fetch(BASE_PATH + '/api/fix'),
-        ]);
-
-        if (lopsResp.ok) {
-            const lops = await lopsResp.json();
-            updateLOPs(lops, chains, traceColors);
-        }
-
-        if (fixResp.ok) {
-            const fix = await fixResp.json();
-            updateFix(fix);
-        }
-    } catch (e) {
-        // Network error — silently ignore, will retry
-    }
+           `LOPs used: ${fix.lop_count !== undefined ? fix.lop_count : '?'}<br>` +
+           `Iterations: ${iterStr}`;
 }
 
 // ---------------------------------------------------------------------------
