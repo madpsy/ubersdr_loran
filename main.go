@@ -480,7 +480,7 @@ func main() {
 	}
 
 	// Start the scope HTTP/WebSocket server.
-	server := NewScopeServer(*webStatic)
+	server := NewScopeServer(*webStatic, iqSampleRate, *updateHz)
 	go func() {
 		addr := fmt.Sprintf(":%d", *webPort)
 		fmt.Fprintf(os.Stderr, "scope server listening on http://localhost%s/\n", addr)

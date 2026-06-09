@@ -38,10 +38,17 @@ const (
 	avgEMA = 1
 	avgIIR = 2
 
-	// nch is the number of simultaneous GRI channels supported.
-	// One per entry in the GRI_LIST table in loran_c.js (14 chains).
+	// nch is the number of simultaneous GRI channels — one per ChainDB entry.
+	// Defined as a constant so it can be used in array bounds at compile time;
+	// a build-time check in init() ensures it matches len(ChainDB).
 	nch = 14
 )
+
+func init() {
+	if len(ChainDB) != nch {
+		panic("nch constant does not match len(ChainDB) — update nch in decoder.go")
+	}
+}
 
 // ---------------------------------------------------------------------------
 // loranChannel mirrors loran_c_ch_t

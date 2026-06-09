@@ -1,60 +1,16 @@
 // loran_c.js — Loran-C scope renderer for ubersdr_loran
 //
-// All GRI_LIST chains are decoded and displayed simultaneously — one row each.
-// There are no per-channel controls; every chain is always on.
+// All chain metadata is fetched from GET /api/chains and GET /api/config.
+// The WebSocket carries only binary scope frames.
+// Zero hardcoded domain knowledge in this file.
 
 'use strict';
 
 const BASE_PATH = (typeof window.BASE_PATH === 'string') ? window.BASE_PATH : '';
 
 // ---------------------------------------------------------------------------
-// GRI chain table
+// Constants
 // ---------------------------------------------------------------------------
-
-const GRI_LIST = [
-    { gri: 5960, name: 'North Russia (Chayka)',   short: ['North Russia',   '(Chayka)'] },
-    { gri: 5990, name: 'Caucasus',                short: ['Caucasus',       ''] },
-    { gri: 5991, name: 'USA west coast (eLoran)', short: ['USA west coast', '(eLoran)'] },
-    { gri: 6000, name: 'China BPL Pucheng',       short: ['China BPL',      'Pucheng'] },
-    { gri: 6731, name: 'Anthorn UK',              short: ['Anthorn UK',     ''] },
-    { gri: 6780, name: 'China South Sea',         short: ['China Sea',      'South'] },
-    { gri: 7430, name: 'China North Sea',         short: ['China Sea',      'North'] },
-    { gri: 7950, name: 'Eastern Russia (Chayka)', short: ['Eastern Russia', '(Chayka)'] },
-    { gri: 8000, name: 'Western Russia (Chayka)', short: ['Western Russia', '(Chayka)'] },
-    { gri: 8390, name: 'China East Sea',          short: ['China Sea',      'East'] },
-    { gri: 8830, name: 'Saudi Arabia North',      short: ['Saudi Arabia',   'North'] },
-    { gri: 8970, name: 'USA east coast (eLoran)', short: ['USA east coast', '(eLoran)'] },
-    { gri: 9930, name: 'Korea',                   short: ['Korea',          ''] },
-    { gri: 9960, name: 'USA east coast (eLoran)', short: ['USA east coast', '(eLoran)'] },
-];
-
-const NCH = GRI_LIST.length; // must match nch in decoder.go
-
-const EMISSION_DELAY = {
-    5960: [{ s:'M Inta', d:0 }, { s:'X Tumanny Pen', d:14670.15 }, { s:'Z Norilsk', d:45915.33 }],
-    5990: [{ s:'M Caucasian Center', d:0 }, { s:'X Caucasian West', d:16587 }, { s:'Y Caucasian East', d:31304 }, { s:'Z Caucasian North', d:46440 }],
-    5991: [{ s:'M George | Variable: Fallon, Havre', d:0 }],
-    6000: [{ s:'M Pucheng', d:0 }],
-    6731: [{ s:'M Anthorn', d:0 }, { s:'Y Anthorn', d:27300.00 }],
-    6780: [{ s:'M Hexian', d:0 }, { s:'X Raoping', d:14464.69 }, { s:'Y Chongzuo', d:26925.76 }],
-    7430: [{ s:'M Rongcheng', d:0 }, { s:'X Xuancheng', d:13459.70 }, { s:'Y Helong', d:30852.32 }],
-    7950: [{ s:'M Aleksandrovsk', d:0 }, { s:'W Petropavlovsk', d:14506.50 }, { s:'X Ussuriisk', d:33678.00 }, { s:'Y (ex-Tokachibuto)', d:49104.15 }, { s:'Z Okhotsk', d:64102.05 }],
-    8000: [{ s:'M Bryansk', d:0 }, { s:'W Petrozavodsk', d:13217.21 }, { s:'X Slonim', d:27125.00 }, { s:'Y Simferopol', d:53070.25 }, { s:'Z Syzran', d:67941.60 }],
-    8390: [{ s:'M Xuancheng', d:0 }, { s:'X Raoping', d:13795.52 }, { s:'Y Rongcheng', d:31459.70 }],
-    8830: [{ s:'M Afif', d:0 }, { s:'W Salwa', d:13645.00 }, { s:'X (ex-Al Khamasin)', d:27265.00 }, { s:'Y Ash Shaykh', d:42645.00 }, { s:'Z Al Muwassam', d:58790.00 }],
-    8970: [{ s:'M Wildwood', d:0 }],
-    9930: [{ s:'M Pohang', d:0 }, { s:'W Kwang Ju', d:11946.97 }, { s:'X (ex-Gesashi)', d:25565.52 }, { s:'Y (ex-Niijima)', d:40085.64 }, { s:'Z Ussuriisk', d:54162.44 }],
-    9960: [{ s:'M Wildwood', d:0 }],
-};
-
-const STATION_COLORS = ['red', 'yellow', 'lime', 'blue', 'grey'];
-
-// One distinct trace colour per channel row
-const TRACE_COLORS = [
-    'cyan', 'violet', '#ff9900', '#00ff88', '#ff4488',
-    '#44aaff', '#ffff44', '#ff6644', '#88ff44', '#44ffee',
-    '#cc88ff', '#ff88cc', '#88ccff', '#ffcc44',
-];
 
 const CMD_SCOPE_DATA  = 0;
 const CMD_SCOPE_RESET = 1;
@@ -63,28 +19,80 @@ const SCOPE_START_X = 130;  // pixels reserved for left legend
 const H_LEGEND      = 20;   // pixels for emission-delay bar at bottom of each row
 const ROW_HEIGHT    = 100;  // total pixels per channel row
 
+// Station colour palette (M=red, W/X/Y/Z cycle through the rest)
+const STATION_COLORS = ['#e74c3c', '#f1c40f', '#2ecc71', '#3498db', '#95a5a6'];
+
+// One distinct trace colour per channel row
+const TRACE_COLORS = [
+    '#00d4ff', '#b388ff', '#ff9900', '#00ff88', '#ff4488',
+    '#44aaff', '#ffff44', '#ff6644', '#88ff44', '#44ffee',
+    '#cc88ff', '#ff88cc', '#88ccff', '#ffcc44',
+];
+
 // ---------------------------------------------------------------------------
-// State
+// Runtime state — populated from /api/chains and /api/config
+// ---------------------------------------------------------------------------
+
+let chains   = [];   // Chain[] from /api/chains
+let config   = null; // configResponse from /api/config
+let msPerBin = 0;
+let NCH      = 0;
+
+// nbuckets per channel (updated when first data arrives)
+let nbuckets = [];
+
+// ---------------------------------------------------------------------------
+// Canvas state
 // ---------------------------------------------------------------------------
 
 let ws = null;
-let msPerBin = 0;
 let canvas, ctx;
 let scopeWidth = 0;
-
-// nbuckets per channel (updated when first data arrives)
-const nbuckets = new Array(NCH).fill(0);
 
 // ---------------------------------------------------------------------------
 // Layout helpers
 // ---------------------------------------------------------------------------
 
 function rowTop(i)    { return i * ROW_HEIGHT; }
-function rowBottom(i) { return (i + 1) * ROW_HEIGHT - H_LEGEND; } // top of legend bar
+function rowBottom(i) { return (i + 1) * ROW_HEIGHT - H_LEGEND; }
 function scopeH()     { return ROW_HEIGHT - H_LEGEND; }
 
 // ---------------------------------------------------------------------------
-// WebSocket
+// Bootstrap — fetch config then connect
+// ---------------------------------------------------------------------------
+
+async function bootstrap() {
+    try {
+        const [chainsResp, configResp] = await Promise.all([
+            fetch(BASE_PATH + '/api/chains'),
+            fetch(BASE_PATH + '/api/config'),
+        ]);
+
+        if (!chainsResp.ok) throw new Error('/api/chains ' + chainsResp.status);
+        if (!configResp.ok) throw new Error('/api/config ' + configResp.status);
+
+        chains   = await chainsResp.json();
+        config   = await configResp.json();
+        msPerBin = config.ms_per_bin;
+        NCH      = chains.length;
+        nbuckets = new Array(NCH).fill(0);
+
+        resizeCanvas();
+        window.addEventListener('resize', resizeCanvas);
+        canvas.addEventListener('click', onCanvasClick);
+
+        connect();
+    } catch (err) {
+        console.error('bootstrap failed:', err);
+        document.getElementById('status').textContent = 'Config error: ' + err.message;
+        document.getElementById('status').className = 'status-err';
+        // Retry after 5 s
+        setTimeout(bootstrap, 5000);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WebSocket — binary scope frames only
 // ---------------------------------------------------------------------------
 
 function connect() {
@@ -95,12 +103,12 @@ function connect() {
     ws.onopen = () => {
         document.getElementById('status').textContent = 'Connected';
         document.getElementById('status').className = 'status-ok';
-        sendControl({ type: 'start' });
-        // Register every GRI with its channel index
+        sendWS({ type: 'start' });
+        // Register every chain with its channel index
         for (let i = 0; i < NCH; i++) {
-            const gri = GRI_LIST[i].gri;
-            // 5991 shares the 5990 transmitter on the server side
-            sendControl({ type: 'set_gri', ch: i, gri: gri === 5991 ? 5990 : gri });
+            const gri = chains[i].gri;
+            // GRI 5991 (US west coast eLoran test) shares the 5990 transmitter
+            sendWS({ type: 'set_gri', ch: i, gri: gri === 5991 ? 5990 : gri });
         }
     };
 
@@ -113,12 +121,22 @@ function connect() {
     ws.onerror = (e) => console.error('WS error', e);
 
     ws.onmessage = (evt) => {
-        if (evt.data instanceof ArrayBuffer) handleBinary(evt.data);
-        else handleText(evt.data);
+        if (evt.data instanceof ArrayBuffer) {
+            handleBinary(evt.data);
+        } else {
+            // Text frame: server may push updated ms_per_bin on reconnect
+            try {
+                const msg = JSON.parse(evt.data);
+                if (msg.type === 'ms_per_bin') {
+                    msPerBin = parseFloat(msg.ms_per_bin);
+                    for (let i = 0; i < NCH; i++) drawLegend(i);
+                }
+            } catch(e) { /* ignore */ }
+        }
     };
 }
 
-function sendControl(obj) {
+function sendWS(obj) {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
@@ -128,26 +146,13 @@ function sendControl(obj) {
 
 function handleBinary(buf) {
     const ba = new Uint8Array(buf);
-    if (ba[0] !== 0x44 || ba[1] !== 0x41 || ba[2] !== 0x54) return;
+    if (ba[0] !== 0x44 || ba[1] !== 0x41 || ba[2] !== 0x54) return; // "DAT"
     const cmd   = ba[3];
     const chIdx = ba[4];
     const data  = ba.slice(5);
     if (chIdx < 0 || chIdx >= NCH) return;
     nbuckets[chIdx] = data.length;
     drawScope(chIdx, cmd, data);
-}
-
-// ---------------------------------------------------------------------------
-// Text frame
-// ---------------------------------------------------------------------------
-
-function handleText(raw) {
-    let msg;
-    try { msg = JSON.parse(raw); } catch(e) { return; }
-    if (msg.type === 'ms_per_bin') {
-        msPerBin = parseFloat(msg.ms_per_bin);
-        for (let i = 0; i < NCH; i++) drawLegend(i);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +179,7 @@ function drawScope(chIdx, cmd, data) {
     ctx.fillStyle = BG;
     ctx.fillRect(sx, rowTop(chIdx), blen, yh);
 
-    // Pass 2 — wide soft glow (5px) for any non-zero sample
+    // Pass 2 — wide soft glow (5px)
     ctx.globalAlpha = 0.18;
     ctx.fillStyle = color;
     for (let i = 0; i < blen; i++) {
@@ -223,55 +228,56 @@ function drawScope(chIdx, cmd, data) {
 }
 
 function drawLegend(chIdx) {
-    if (!canvas) return;
-    const gri   = GRI_LIST[chIdx].gri;
-    const entry = GRI_LIST[chIdx];
+    if (!canvas || chIdx >= chains.length) return;
+    const chain = chains[chIdx];
     const color = TRACE_COLORS[chIdx % TRACE_COLORS.length];
     const sx    = SCOPE_START_X;
-    const yb    = rowBottom(chIdx);   // top of legend bar
+    const yb    = rowBottom(chIdx);
     const yt    = rowTop(chIdx);
 
     // ── Left margin ──────────────────────────────────────────
     ctx.fillStyle = '#08080c';
     ctx.fillRect(0, yt, sx - 1, ROW_HEIGHT);
 
-    // Thin left accent bar — full brightness
+    // Thin left accent bar
     ctx.fillStyle = color;
     ctx.fillRect(0, yt + 2, 3, ROW_HEIGHT - 4);
 
     // GRI number — bold, trace colour
     ctx.font = 'bold 11px "Inter", system-ui, sans-serif';
     ctx.fillStyle = color;
-    ctx.fillText('GRI ' + gri, 7, yt + 14);
+    ctx.fillText('GRI ' + chain.gri, 7, yt + 14);
 
     // Chain name lines — muted
     ctx.font = '10px "Inter", system-ui, sans-serif';
     ctx.fillStyle = '#808090';
-    ctx.fillText(entry.short[0], 7, yt + 27);
-    if (entry.short[1]) ctx.fillText(entry.short[1], 7, yt + 39);
+    ctx.fillText(chain.short[0], 7, yt + 27);
+    if (chain.short[1]) ctx.fillText(chain.short[1], 7, yt + 39);
 
     // ── Emission-delay bar ───────────────────────────────────
     ctx.fillStyle = '#08080c';
     ctx.fillRect(sx, yb, scopeWidth - sx, H_LEGEND);
 
-    if (msPerBin === 0) return;
-    const ed = EMISSION_DELAY[gri];
-    if (!ed) return;
+    if (msPerBin === 0 || !chain.stations || chain.stations.length === 0) return;
 
-    for (let i = 0; i < ed.length; i++) {
-        let ed0 = Math.round((ed[i].d / 1000) / msPerBin);
-        let ed1 = Math.round(((i < ed.length - 1 ? ed[i + 1].d : gri * 10) / 1000) / msPerBin);
+    const stations = chain.stations;
+    for (let i = 0; i < stations.length; i++) {
+        const st  = stations[i];
+        const next = stations[i + 1];
 
-        // Coloured segment
+        let ed0 = Math.round((st.delay_us / 1000) / msPerBin);
+        let ed1 = next
+            ? Math.round((next.delay_us / 1000) / msPerBin)
+            : Math.round((chain.gri / 100));  // end of GRI period in buckets
+
         ctx.fillStyle = STATION_COLORS[i % STATION_COLORS.length];
         ctx.globalAlpha = 0.85;
         ctx.fillRect(sx + ed0, yb + 1, Math.max(ed1 - ed0 - 1, 1), 5);
         ctx.globalAlpha = 1.0;
 
-        // Station label
         ctx.font = '9px "Inter", system-ui, sans-serif';
         ctx.fillStyle = '#c0c0cc';
-        ctx.fillText(ed[i].s, sx + ed0 + 2, yb + H_LEGEND - 4);
+        ctx.fillText(st.id + ' ' + st.name, sx + ed0 + 2, yb + H_LEGEND - 4);
     }
 }
 
@@ -290,7 +296,7 @@ function onCanvasClick(evt) {
     if (chIdx < 0 || chIdx >= NCH) return;
     const offset = Math.round(x) - SCOPE_START_X;
     if (offset < 0 || offset >= nbuckets[chIdx]) return;
-    sendControl({ type: 'set_offset', ch: chIdx, offset: offset });
+    sendWS({ type: 'set_offset', ch: chIdx, offset: offset });
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +304,7 @@ function onCanvasClick(evt) {
 // ---------------------------------------------------------------------------
 
 function resizeCanvas() {
-    if (!canvas) return;
+    if (!canvas || NCH === 0) return;
     const w = document.getElementById('scope-container').clientWidth;
     scopeWidth    = w;
     canvas.width  = w;
@@ -308,7 +314,6 @@ function resizeCanvas() {
     ctx.fillRect(0, 0, w, canvas.height);
 
     for (let i = 0; i < NCH; i++) {
-        // Row separator
         if (i > 0) {
             ctx.strokeStyle = '#22222a';
             ctx.lineWidth = 1;
@@ -328,10 +333,7 @@ function resizeCanvas() {
 function init() {
     canvas = document.getElementById('scope');
     ctx    = canvas.getContext('2d');
-    resizeCanvas();
-    window.addEventListener('resize', resizeCanvas);
-    canvas.addEventListener('click', onCanvasClick);
-    connect();
+    bootstrap();
 }
 
 document.addEventListener('DOMContentLoaded', init);

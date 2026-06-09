@@ -61,8 +61,10 @@ type scopeClient struct {
 // ScopeServer manages the HTTP mux, connected WebSocket clients, and the
 // active LoranDecoder instance.
 type ScopeServer struct {
-	staticDir string
-	indexTmpl *template.Template
+	staticDir  string
+	indexTmpl  *template.Template
+	sampleRate int
+	updateHz   int
 
 	clientsMu sync.RWMutex
 	clients   map[*scopeClient]struct{}
@@ -76,19 +78,24 @@ type ScopeServer struct {
 // NewScopeServer creates a new ScopeServer serving static files from staticDir.
 // index.html is parsed as a Go template so that {{.BasePath}} is substituted
 // with the X-Forwarded-Prefix header value at request time.
-func NewScopeServer(staticDir string) *ScopeServer {
+func NewScopeServer(staticDir string, sampleRate, updateHz int) *ScopeServer {
 	tmpl, err := template.ParseFiles(staticDir + "/index.html")
 	if err != nil {
 		log.Fatalf("failed to parse index.html template: %v", err)
 	}
 
 	s := &ScopeServer{
-		staticDir: staticDir,
-		indexTmpl: tmpl,
-		clients:   make(map[*scopeClient]struct{}),
+		staticDir:  staticDir,
+		indexTmpl:  tmpl,
+		sampleRate: sampleRate,
+		updateHz:   updateHz,
+		clients:    make(map[*scopeClient]struct{}),
 	}
 	s.mux = http.NewServeMux()
 	s.mux.HandleFunc("/ws", s.handleWS)
+	s.mux.HandleFunc("/api/chains", s.handleAPIChains)
+	s.mux.HandleFunc("/api/config", s.handleAPIConfig)
+	s.mux.HandleFunc("/api/control", s.handleAPIControl)
 	s.mux.HandleFunc("/", s.handleHTTP)
 	return s
 }
@@ -317,6 +324,98 @@ func (s *ScopeServer) clientCount() int {
 	s.clientsMu.RLock()
 	defer s.clientsMu.RUnlock()
 	return len(s.clients)
+}
+
+// ---------------------------------------------------------------------------
+// REST API handlers
+// ---------------------------------------------------------------------------
+
+// handleAPIChains serves GET /api/chains — the full GRI chain database.
+// Response: JSON array of Chain objects (see chains.go).
+func (s *ScopeServer) handleAPIChains(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if err := json.NewEncoder(w).Encode(ChainDB); err != nil {
+		log.Printf("handleAPIChains encode: %v", err)
+	}
+}
+
+// configResponse is the JSON shape returned by GET /api/config.
+type configResponse struct {
+	SampleRate int             `json:"sample_rate"`
+	UpdateHz   int             `json:"update_hz"`
+	MsPerBin   float64         `json:"ms_per_bin"`
+	Channels   []channelConfig `json:"channels"`
+}
+
+type channelConfig struct {
+	Index int    `json:"index"`
+	GRI   uint32 `json:"gri"`
+}
+
+// handleAPIConfig serves GET /api/config — current runtime configuration.
+func (s *ScopeServer) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	msPerBin := 1.0 / float64(s.sampleRate) * 1e3
+
+	channels := make([]channelConfig, len(ChainDB))
+	for i, c := range ChainDB {
+		channels[i] = channelConfig{Index: i, GRI: c.GRI}
+	}
+
+	resp := configResponse{
+		SampleRate: s.sampleRate,
+		UpdateHz:   s.updateHz,
+		MsPerBin:   msPerBin,
+		Channels:   channels,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	if err := json.NewEncoder(w).Encode(resp); err != nil {
+		log.Printf("handleAPIConfig encode: %v", err)
+	}
+}
+
+// handleAPIControl serves POST /api/control — accepts the same JSON control
+// messages previously sent over the WebSocket, allowing non-browser clients
+// to adjust decoder parameters via plain HTTP.
+//
+// Supported body shapes (same as handleControl):
+//
+//	{ "type": "set_gri",       "ch": 0, "gri": 8000 }
+//	{ "type": "set_gain",      "ch": 0, "gain": 0 }
+//	{ "type": "set_offset",    "ch": 0, "offset": 42 }
+//	{ "type": "set_avg_algo",  "ch": 0, "algo": 1 }
+//	{ "type": "set_avg_param", "ch": 0, "param": 256.0 }
+//	{ "type": "start" }
+func (s *ScopeServer) handleAPIControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	var body []byte
+	buf := make([]byte, 4096)
+	for {
+		n, err := r.Body.Read(buf)
+		body = append(body, buf[:n]...)
+		if err != nil {
+			break
+		}
+	}
+
+	s.handleControl(body)
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // floatVal safely extracts a float64 from a JSON map value.
