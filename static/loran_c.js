@@ -57,6 +57,10 @@ let nbuckets = [];
 // key = chIdx, value = { snr, peak_bin, ... }
 const channelQuality = {};
 
+// Per-channel auto-track delta (from quality_update WS messages)
+// key = chIdx, value = last delta in bins (0 = locked, non-zero = adjusting)
+const channelTrackDelta = {};
+
 // Per-channel TDOA measurements (from tdoa_update WS messages)
 // key = chIdx, value = TDOAMeasurement[]
 const channelTDOA = {};
@@ -90,12 +94,54 @@ function dispatchWsMessage(msg) {
 }
 
 // ---------------------------------------------------------------------------
+// Display order — heard channels float to the top, sorted by SNR descending
+// ---------------------------------------------------------------------------
+
+// displayOrder[visualRow] = chIdx  (which physical channel is drawn in that row)
+// rowOfChannel[chIdx]     = visualRow
+let displayOrder = [];
+let rowOfChannel = [];
+
+// Recompute displayOrder by sorting heard channels (SNR ≥ SNR_GOOD) to the
+// top (by SNR descending), then unheard channels below (by chIdx ascending).
+// Returns true if the order changed.
+function recomputeDisplayOrder() {
+    const heard   = [];
+    const unheard = [];
+    for (let i = 0; i < NCH; i++) {
+        const q = channelQuality[i];
+        const snr = (q && q.snr_db !== undefined) ? q.snr_db : -Infinity;
+        if (snr >= SNR_GOOD) heard.push({ ch: i, snr });
+        else                 unheard.push({ ch: i, snr });
+    }
+    heard.sort((a, b) => b.snr - a.snr);
+    unheard.sort((a, b) => a.ch - b.ch);
+
+    const newOrder = [...heard.map(x => x.ch), ...unheard.map(x => x.ch)];
+    let changed = false;
+    for (let i = 0; i < NCH; i++) {
+        if (newOrder[i] !== displayOrder[i]) { changed = true; break; }
+    }
+    displayOrder = newOrder;
+    rowOfChannel = new Array(NCH);
+    for (let i = 0; i < NCH; i++) rowOfChannel[displayOrder[i]] = i;
+    return changed;
+}
+
+// Initialise identity order (before any quality data arrives)
+function initDisplayOrder() {
+    displayOrder = Array.from({ length: NCH }, (_, i) => i);
+    rowOfChannel = Array.from({ length: NCH }, (_, i) => i);
+}
+
+// ---------------------------------------------------------------------------
 // Layout helpers
 // ---------------------------------------------------------------------------
 
-function rowTop(i)    { return i * ROW_HEIGHT; }
-function rowBottom(i) { return (i + 1) * ROW_HEIGHT - H_LEGEND; }
-function scopeH()     { return ROW_HEIGHT - H_LEGEND; }
+// rowTop / rowBottom take a chIdx and map it through displayOrder.
+function rowTop(chIdx)    { const r = rowOfChannel[chIdx] ?? chIdx; return r * ROW_HEIGHT; }
+function rowBottom(chIdx) { const r = rowOfChannel[chIdx] ?? chIdx; return (r + 1) * ROW_HEIGHT - H_LEGEND; }
+function scopeH()         { return ROW_HEIGHT - H_LEGEND; }
 
 // ---------------------------------------------------------------------------
 // "Heard only" filter — driven by #valid-only checkbox
@@ -127,12 +173,11 @@ function applyRowDimOverlay(chIdx) {
     }
 }
 
-// Re-draw all legends and re-apply dim overlays (called when checkbox toggles)
+// Re-draw all legends and re-apply dim overlays (called when checkbox toggles).
+// Also recomputes display order so heard channels float to the top.
 function redrawAllLegends() {
-    for (let i = 0; i < NCH; i++) {
-        drawLegend(i);
-        applyRowDimOverlay(i);
-    }
+    recomputeDisplayOrder();
+    resizeCanvas(); // full repaint — order may have changed
 }
 
 // ---------------------------------------------------------------------------
@@ -154,13 +199,13 @@ async function bootstrap() {
         msPerBin = config.ms_per_bin;
         NCH      = chains.length;
         nbuckets = new Array(NCH).fill(0);
+        initDisplayOrder();
 
         // Expose chains for map.js / tdoa_panel.js
         window.loranChains = chains;
 
         resizeCanvas();
         window.addEventListener('resize', resizeCanvas);
-        canvas.addEventListener('click', onCanvasClick);
 
         // Wire "heard only" checkbox — redraw all legends on toggle
         const validOnlyCb = document.getElementById('valid-only');
@@ -198,13 +243,8 @@ function connect() {
     ws.onopen = () => {
         document.getElementById('status').textContent = 'Connected';
         document.getElementById('status').className = 'status-ok';
-        sendWS({ type: 'start' });
-        // Register every chain with its channel index
-        for (let i = 0; i < NCH; i++) {
-            const gri = chains[i].gri;
-            // GRI 5991 (US west coast eLoran test) shares the 5990 transmitter
-            sendWS({ type: 'set_gri', ch: i, gri: gri === 5991 ? 5990 : gri });
-        }
+        // Read-only viewer — no control messages sent to server.
+        // GRIs and decoder start are handled server-side at startup.
     };
 
     ws.onclose = () => {
@@ -227,9 +267,6 @@ function connect() {
     };
 }
 
-function sendWS(obj) {
-    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
-}
 
 // ---------------------------------------------------------------------------
 // JSON message dispatcher
@@ -251,10 +288,19 @@ function handleJsonMessage(msg) {
                         channelQuality[q.ch_idx] = q;
                     }
                 });
-                // Do NOT redraw legends here — handleBinary() redraws them at
-                // ~10 Hz on every scope frame, so forcing a redraw here causes
-                // a visible flash every second.  The updated SNR values will be
-                // picked up naturally on the next scope frame.
+                // Store per-channel auto-track deltas if present.
+                if (Array.isArray(msg.track_deltas)) {
+                    msg.track_deltas.forEach((delta, i) => {
+                        channelTrackDelta[i] = delta;
+                    });
+                }
+                // Recompute display order — heard channels float to the top.
+                // If the order changed, do a full canvas repaint so rows move
+                // to their new positions.  The repaint is cheap (just legends
+                // + backgrounds; traces will be redrawn on the next binary frame).
+                if (recomputeDisplayOrder()) {
+                    resizeCanvas();
+                }
             }
             break;
         }
@@ -388,28 +434,30 @@ function drawScope(chIdx, cmd, data) {
 function drawPeakMarkers(chIdx) {
     if (!canvas || chIdx >= chains.length) return;
 
-    const tdoas = channelTDOA[chIdx];
-    if (!tdoas || tdoas.length === 0) return;
-
     const sx = SCOPE_START_X;
     const yb = rowBottom(chIdx);
     const yh = scopeH();
 
     // Master peak — from quality data (JSON fields: snr_db, peak_bin)
+    // Draw whenever SNR ≥ SNR_WARN, regardless of whether TDOA data exists.
+    // peak_bin can legitimately be 0 (well-aligned GRI), so don't gate on > 0.
     const q = channelQuality[chIdx];
-    if (q && q.snr_db >= SNR_WARN && q.peak_bin > 0) {
+    if (q && q.snr_db >= SNR_WARN && q.peak_bin !== undefined) {
         const x = sx + q.peak_bin;
         if (x >= sx && x < scopeWidth) {
-            drawTickMark(x, yb, yh, STATION_COLORS[0], null);
+            drawTickMark(x, yb, yh, STATION_COLORS[0], 'M');
         }
     }
 
     // Secondary peaks — from TDOA measurements
     // TDOAMeasurement JSON fields: snr_db (secondary SNR), peak_bin (secondary peak bucket)
+    const tdoas = channelTDOA[chIdx];
+    if (!tdoas) return;
     tdoas.forEach((m, i) => {
         if (!m.valid) return;
         if ((m.snr_db || 0) < SNR_WARN) return;
-        if (!m.peak_bin || m.peak_bin <= 0) return;
+        // peak_bin can be 0 — only skip if undefined/null
+        if (m.peak_bin === undefined || m.peak_bin === null) return;
 
         const x = sx + m.peak_bin;
         if (x < sx || x >= scopeWidth) return;
@@ -417,50 +465,60 @@ function drawPeakMarkers(chIdx) {
         const color = STATION_COLORS[(i + 1) % STATION_COLORS.length];
         const label = m.tdoa_us !== undefined
             ? (m.tdoa_us >= 0 ? '+' : '') + m.tdoa_us.toFixed(1) + 'µs'
-            : null;
+            : m.secondary_id || null;
         drawTickMark(x, yb, yh, color, label);
     });
 }
 
 /**
  * Draw a vertical tick mark at canvas x position.
+ * The label and arrowhead are drawn at the TOP of the row so they are
+ * always visible above the signal trace regardless of peak height.
+ *
  * @param {number} x       - canvas x coordinate
  * @param {number} yb      - row bottom y (trace baseline)
  * @param {number} yh      - row height (trace area)
  * @param {string} color   - CSS colour string
- * @param {string|null} label - optional text label above tick
+ * @param {string|null} label - optional text label (drawn at top of row)
  */
 function drawTickMark(x, yb, yh, color, label) {
     ctx.save();
-    ctx.globalAlpha = 0.85;
+
+    const yt = yb - yh; // top of trace area
+
+    // Full-height dashed vertical line
+    ctx.globalAlpha = 0.75;
     ctx.strokeStyle = color;
     ctx.lineWidth   = 1.5;
     ctx.setLineDash([3, 2]);
     ctx.beginPath();
-    ctx.moveTo(x + 0.5, yb);
-    ctx.lineTo(x + 0.5, yb - yh + 4);
+    ctx.moveTo(x + 0.5, yb - 1);
+    ctx.lineTo(x + 0.5, yt + 14); // stop just below the label
     ctx.stroke();
     ctx.setLineDash([]);
 
-    // Small triangle at baseline
+    // Small downward-pointing triangle at the top (arrowhead pointing down
+    // into the trace, so it's clearly above the spike)
     ctx.fillStyle = color;
     ctx.globalAlpha = 1.0;
     ctx.beginPath();
-    ctx.moveTo(x - 3, yb);
-    ctx.lineTo(x + 3, yb);
-    ctx.lineTo(x,     yb - 6);
+    ctx.moveTo(x - 4, yt + 2);
+    ctx.lineTo(x + 4, yt + 2);
+    ctx.lineTo(x,     yt + 9);
     ctx.closePath();
     ctx.fill();
 
-    // Label
+    // Label — drawn above the arrowhead, at the very top of the row
     if (label) {
-        ctx.font = '8px "Inter", system-ui, sans-serif';
+        ctx.font = 'bold 9px "Inter", system-ui, sans-serif';
         ctx.fillStyle = color;
-        ctx.globalAlpha = 0.9;
+        ctx.globalAlpha = 1.0;
         const tw = ctx.measureText(label).width;
-        // Position label to the right, or left if near right edge
-        const lx = (x + tw + 4 < scopeWidth) ? x + 3 : x - tw - 3;
-        ctx.fillText(label, lx, yb - yh + 12);
+        // Centre label on x; shift left if it would overflow right edge
+        let lx = x - tw / 2;
+        if (lx + tw + 2 > scopeWidth) lx = scopeWidth - tw - 2;
+        if (lx < SCOPE_START_X) lx = SCOPE_START_X;
+        ctx.fillText(label, lx, yt + 10);
     }
 
     ctx.restore();
@@ -518,6 +576,23 @@ function drawLegend(chIdx) {
         ctx.fillText(snr.toFixed(1) + 'dB', 18, yt + 56);
     }
 
+    // ── Auto-track status ─────────────────────────────────────
+    // Show tracking state below the SNR badge.
+    // delta=0 → locked (master peak is within hysteresis of target).
+    // delta≠0 → adjusting (number of bins the window was shifted this cycle).
+    const trackDelta = channelTrackDelta[chIdx];
+    if (trackDelta !== undefined) {
+        ctx.font = '9px "Inter", system-ui, sans-serif';
+        if (trackDelta === 0) {
+            ctx.fillStyle = '#22c55e';
+            ctx.fillText('⟳ locked', 7, yt + 68);
+        } else {
+            ctx.fillStyle = '#f59e0b';
+            const sign = trackDelta > 0 ? '+' : '';
+            ctx.fillText('⟳ ' + sign + trackDelta + 'b', 7, yt + 68);
+        }
+    }
+
     // ── Emission-delay bar ───────────────────────────────────
     ctx.fillStyle = '#08080c';
     ctx.fillRect(sx, yb, scopeWidth - sx, H_LEGEND);
@@ -564,23 +639,6 @@ function drawLegend(chIdx) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Canvas click — align master station for the clicked row
-// ---------------------------------------------------------------------------
-
-function onCanvasClick(evt) {
-    if (!canvas) return;
-    const rect   = canvas.getBoundingClientRect();
-    const scaleY = canvas.height / rect.height;
-    const scaleX = canvas.width  / rect.width;
-    const y      = (evt.clientY - rect.top)  * scaleY;
-    const x      = (evt.clientX - rect.left) * scaleX;
-    const chIdx  = Math.floor(y / ROW_HEIGHT);
-    if (chIdx < 0 || chIdx >= NCH) return;
-    const offset = Math.round(x) - SCOPE_START_X;
-    if (offset < 0 || offset >= nbuckets[chIdx]) return;
-    sendWS({ type: 'set_offset', ch: chIdx, offset: offset });
-}
 
 // ---------------------------------------------------------------------------
 // Resize

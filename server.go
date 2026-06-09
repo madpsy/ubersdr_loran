@@ -22,7 +22,6 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -247,9 +246,18 @@ func (s *ScopeServer) buildPushFrames() [][]byte {
 		for i := 0; i < nch; i++ {
 			channels[i] = d.Quality(i)
 		}
+		// Include auto-tracking deltas if the TDOA engine is running.
+		s.tdoaMu.RLock()
+		tdoaEngQ := s.tdoaEng
+		s.tdoaMu.RUnlock()
+		var trackDeltas []int
+		if tdoaEngQ != nil {
+			trackDeltas = tdoaEngQ.TrackDeltas()
+		}
 		if b, err := json.Marshal(map[string]interface{}{
 			"type":          "quality_update",
 			"channels":      channels,
+			"track_deltas":  trackDeltas,
 			"wall_clock_ms": atomic.LoadUint64(&s.wallClockMs),
 		}); err == nil {
 			frames = append(frames, b)
@@ -453,85 +461,15 @@ func (s *ScopeServer) handleWS(w http.ResponseWriter, r *http.Request) {
 		}
 	}()
 
-	// Read pump — handles control messages from the browser.
+	// Read pump — this is a read-only viewer; all inbound messages are
+	// discarded.  We must still read to detect client disconnection and
+	// to satisfy the WebSocket protocol (ping/pong frames are handled by
+	// the gorilla/websocket library automatically).
 	for {
-		_, msg, err := conn.ReadMessage()
-		if err != nil {
+		if _, _, err := conn.ReadMessage(); err != nil {
 			close(c.send)
 			return
 		}
-		s.handleControl(msg)
-	}
-}
-
-// handleControl processes a JSON control message from the browser.
-//
-// Supported message types:
-//
-//	{ "type": "set_gri",       "ch": 0, "gri": 8000 }
-//	{ "type": "set_gain",      "ch": 0, "gain": 0 }
-//	{ "type": "set_offset",    "ch": 0, "offset": 42 }
-//	{ "type": "set_avg_algo",  "ch": 0, "algo": 1 }
-//	{ "type": "set_avg_param", "ch": 0, "param": 256.0 }
-//	{ "type": "start" }
-//
-// ch may be 0 … nch-1.
-func (s *ScopeServer) handleControl(msg []byte) {
-	var m map[string]interface{}
-	if err := json.Unmarshal(msg, &m); err != nil {
-		log.Printf("control parse error: %v", err)
-		return
-	}
-
-	s.decoderMu.RLock()
-	d := s.decoder
-	s.decoderMu.RUnlock()
-	if d == nil {
-		return
-	}
-
-	msgType, _ := m["type"].(string)
-	ch := int(floatVal(m, "ch"))
-	if ch < 0 || ch >= nch {
-		ch = 0
-	}
-
-	switch msgType {
-	case "set_gri":
-		gri := uint32(floatVal(m, "gri"))
-		if gri > 0 && gri <= maxGRI {
-			d.SetGRI(ch, gri)
-			log.Printf("set_gri ch%d gri=%d", ch, gri)
-		}
-
-	case "set_gain":
-		gain := int(floatVal(m, "gain"))
-		d.SetGain(ch, gain)
-		log.Printf("set_gain ch%d gain=%d", ch, gain)
-
-	case "set_offset":
-		offset := int(floatVal(m, "offset"))
-		d.SetOffset(ch, offset)
-		log.Printf("set_offset ch%d offset=%d", ch, offset)
-
-	case "set_avg_algo":
-		algo := int(floatVal(m, "algo"))
-		if algo >= avgCMA && algo <= avgIIR {
-			d.SetAvgAlgo(ch, algo)
-			log.Printf("set_avg_algo ch%d algo=%d", ch, algo)
-		}
-
-	case "set_avg_param":
-		param := floatVal(m, "param")
-		d.SetAvgParam(ch, param)
-		log.Printf("set_avg_param ch%d param=%.2f", ch, param)
-
-	case "start":
-		d.Start()
-		log.Printf("start")
-
-	default:
-		log.Printf("unknown control type: %s", msgType)
 	}
 }
 
@@ -612,28 +550,11 @@ func (s *ScopeServer) handleAPIConfig(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// handleAPIControl serves POST /api/control — accepts the same JSON control
-// messages previously sent over the WebSocket, allowing non-browser clients
-// to adjust decoder parameters via plain HTTP.
+// handleAPIControl is intentionally disabled — this is a read-only viewer.
+// Decoder parameters are set server-side at startup; no external client
+// should be able to mutate decoder state.
 func (s *ScopeServer) handleAPIControl(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-
-	var body []byte
-	buf := make([]byte, 4096)
-	for {
-		n, err := r.Body.Read(buf)
-		body = append(body, buf[:n]...)
-		if err != nil {
-			break
-		}
-	}
-
-	s.handleControl(body)
-	w.WriteHeader(http.StatusNoContent)
+	http.Error(w, "read-only viewer — control endpoint disabled", http.StatusMethodNotAllowed)
 }
 
 // handleAPITDOA serves GET /api/tdoa — latest TDOA measurements.
@@ -819,25 +740,6 @@ func (s *ScopeServer) handleAPIFix(w http.ResponseWriter, r *http.Request) {
 	if err := json.NewEncoder(w).Encode(fix); err != nil {
 		log.Printf("handleAPIFix encode: %v", err)
 	}
-}
-
-// floatVal safely extracts a float64 from a JSON map value.
-func floatVal(m map[string]interface{}, key string) float64 {
-	v, ok := m[key]
-	if !ok {
-		return 0
-	}
-	switch t := v.(type) {
-	case float64:
-		return t
-	case int:
-		return float64(t)
-	case string:
-		var f float64
-		fmt.Sscanf(t, "%f", &f)
-		return f
-	}
-	return 0
 }
 
 // Ensure atomic.StoreUint64 alignment on 32-bit platforms.

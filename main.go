@@ -478,6 +478,17 @@ func (c *client) runOnce() (reconnect bool) {
 				fmt.Fprintf(os.Stderr, "receiving IQ: %d Hz sample rate, %d channel(s), mode=%s\n",
 					rate, ch, c.iqMode)
 				loranDec = NewLoranDecoder(float64(rate), c.updateHz)
+				// Set GRIs for all chains from ChainDB before starting.
+				// This is done server-side so no browser client needs to send
+				// control messages (which would be a security risk on a public server).
+				for chIdx, chain := range ChainDB {
+					gri := chain.GRI
+					// GRI 5991 (US west coast eLoran test) shares the 5990 transmitter
+					if gri == 5991 {
+						gri = 5990
+					}
+					loranDec.SetGRI(chIdx, gri)
+				}
 				loranDec.Start()
 				tdoaEng = NewTDOAEngine(loranDec)
 				lopEng := NewLOPEngine(tdoaEng)

@@ -103,14 +103,40 @@ type TDOAMeasurement struct {
 type TDOAEngine struct {
 	dec *LoranDecoder
 
-	mu      sync.RWMutex
-	results []TDOAMeasurement // latest results, one per secondary station across all chains
+	mu          sync.RWMutex
+	results     []TDOAMeasurement // latest results, one per secondary station across all chains
+	trackDeltas []int             // per-channel: last auto-track delta applied (bins); 0 = locked
 }
 
 // NewTDOAEngine creates a TDOAEngine attached to the given decoder.
 func NewTDOAEngine(dec *LoranDecoder) *TDOAEngine {
-	return &TDOAEngine{dec: dec}
+	return &TDOAEngine{
+		dec:         dec,
+		trackDeltas: make([]int, nch),
+	}
 }
+
+// TrackDeltas returns a snapshot of the last auto-track delta for each channel.
+// A value of 0 means the master peak was already within the hysteresis band
+// (locked); a non-zero value is the number of bins the window was shifted.
+func (e *TDOAEngine) TrackDeltas() []int {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]int, len(e.trackDeltas))
+	copy(out, e.trackDeltas)
+	return out
+}
+
+// autoTrackHysteresisBins is the minimum distance (in bins) between the
+// current master peak position and the target position before auto-tracking
+// adjusts the GRI window offset.  A small hysteresis prevents jitter when
+// the peak is already near the target.
+const autoTrackHysteresisBins = 5
+
+// autoTrackTargetFrac is the fractional position within the GRI buffer where
+// the master peak should be placed by auto-tracking.  0.20 means 20% from
+// the left edge, leaving 80% of the buffer for the secondaries that follow.
+const autoTrackTargetFrac = 0.20
 
 // Update recomputes TDOA measurements for all chains.
 // Called after each scope frame (or on demand).
@@ -169,6 +195,28 @@ func (e *TDOAEngine) Update() {
 		masterStation := chain.Stations[0]
 		masterBin, masterSub, masterSNR := findPeak(avg, 0, len(avg))
 		masterValid := masterSNR >= minSNRdB
+
+		// Auto-track: if the master is clearly heard, shift the GRI window so
+		// the master peak lands at autoTrackTargetFrac of the buffer.  This
+		// keeps the master visible near the left of the scope and leaves room
+		// for all secondaries (which arrive later) to the right.
+		// Only adjust when the peak is far enough from the target (hysteresis)
+		// to avoid jitter on a peak that is already well-positioned.
+		// Record the delta (0 = locked, non-zero = adjusting) for status display.
+		trackDelta := 0
+		if masterValid {
+			targetBin := int(float64(len(avg)) * autoTrackTargetFrac)
+			delta := masterBin - targetBin
+			if delta < -autoTrackHysteresisBins || delta > autoTrackHysteresisBins {
+				e.dec.SetOffset(chIdx, delta)
+				trackDelta = delta
+			}
+		}
+		e.mu.Lock()
+		if chIdx < len(e.trackDeltas) {
+			e.trackDeltas[chIdx] = trackDelta
+		}
+		e.mu.Unlock()
 
 		// For each secondary, find its peak in the window starting at
 		// emissionDelay/usPerBin bins after the master peak.
