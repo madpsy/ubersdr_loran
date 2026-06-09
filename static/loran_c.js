@@ -61,7 +61,7 @@ const CMD_SCOPE_RESET = 1;
 
 const SCOPE_START_X = 130;  // pixels reserved for left legend
 const H_LEGEND      = 20;   // pixels for emission-delay bar at bottom of each row
-const ROW_HEIGHT    = 90;   // total pixels per channel row
+const ROW_HEIGHT    = 100;  // total pixels per channel row
 
 // ---------------------------------------------------------------------------
 // State
@@ -160,33 +160,66 @@ function drawScope(chIdx, cmd, data) {
     const yb    = rowBottom(chIdx);
     const yh    = scopeH();
     const color = TRACE_COLORS[chIdx % TRACE_COLORS.length];
+    const BG    = '#08080c';
 
     if (cmd === CMD_SCOPE_RESET) {
-        ctx.fillStyle = '#050507';
+        ctx.fillStyle = BG;
         ctx.fillRect(sx, rowTop(chIdx), scopeWidth - sx, yh);
         drawLegend(chIdx);
     }
 
     const blen = data.length;
+
+    // Pass 1 — clear all columns to background
+    ctx.fillStyle = BG;
+    ctx.fillRect(sx, rowTop(chIdx), blen, yh);
+
+    // Pass 2 — wide soft glow (5px) for any non-zero sample
+    ctx.globalAlpha = 0.18;
+    ctx.fillStyle = color;
     for (let i = 0; i < blen; i++) {
         const z = data[i] / 255;
-        // Background column
-        ctx.fillStyle = '#050507';
-        ctx.fillRect(sx + i, yb, 1, -yh);
-        if (z > 0) {
-            // Glow: faint wide bar behind the trace
-            ctx.fillStyle = color;
-            ctx.globalAlpha = 0.12;
-            ctx.fillRect(sx + i, yb, 1, z * -yh);
-            // Solid trace
-            ctx.globalAlpha = 0.9;
-            ctx.fillRect(sx + i, yb, 1, Math.max(z * -yh, -1));
-            ctx.globalAlpha = 1.0;
+        if (z > 0.01) {
+            const h = z * yh;
+            ctx.fillRect(sx + i - 2, yb - h, 5, h);
         }
     }
+
+    // Pass 3 — medium glow (3px)
+    ctx.globalAlpha = 0.35;
+    for (let i = 0; i < blen; i++) {
+        const z = data[i] / 255;
+        if (z > 0.01) {
+            const h = z * yh;
+            ctx.fillRect(sx + i - 1, yb - h, 3, h);
+        }
+    }
+
+    // Pass 4 — solid 1px trace at full brightness
+    ctx.globalAlpha = 1.0;
+    for (let i = 0; i < blen; i++) {
+        const z = data[i] / 255;
+        if (z > 0.01) {
+            const h = Math.max(z * yh, 1);
+            ctx.fillRect(sx + i, yb - h, 1, h);
+        }
+    }
+
+    // Pass 5 — bright 1px tip at the peak of each column
+    ctx.fillStyle = 'white';
+    ctx.globalAlpha = 0.7;
+    for (let i = 0; i < blen; i++) {
+        const z = data[i] / 255;
+        if (z > 0.05) {
+            ctx.fillRect(sx + i, yb - Math.ceil(z * yh), 1, 1);
+        }
+    }
+
+    ctx.globalAlpha = 1.0;
+
     // Clear right of data
-    ctx.fillStyle = '#050507';
-    ctx.fillRect(sx + blen, yb, scopeWidth - sx - blen + 1, -yh);
+    ctx.fillStyle = BG;
+    ctx.fillRect(sx + blen, rowTop(chIdx), scopeWidth - sx - blen + 1, yh);
 }
 
 function drawLegend(chIdx) {
@@ -199,29 +232,26 @@ function drawLegend(chIdx) {
     const yt    = rowTop(chIdx);
 
     // ── Left margin ──────────────────────────────────────────
-    // Subtle tinted background matching the trace colour
-    ctx.fillStyle = '#0d0d0f';
+    ctx.fillStyle = '#08080c';
     ctx.fillRect(0, yt, sx - 1, ROW_HEIGHT);
 
-    // Thin left accent bar
+    // Thin left accent bar — full brightness
     ctx.fillStyle = color;
-    ctx.globalAlpha = 0.7;
     ctx.fillRect(0, yt + 2, 3, ROW_HEIGHT - 4);
-    ctx.globalAlpha = 1.0;
 
     // GRI number — bold, trace colour
     ctx.font = 'bold 11px "Inter", system-ui, sans-serif';
     ctx.fillStyle = color;
     ctx.fillText('GRI ' + gri, 7, yt + 14);
 
-    // Chain name lines — muted white
+    // Chain name lines — muted
     ctx.font = '10px "Inter", system-ui, sans-serif';
-    ctx.fillStyle = '#9090a0';
+    ctx.fillStyle = '#808090';
     ctx.fillText(entry.short[0], 7, yt + 27);
     if (entry.short[1]) ctx.fillText(entry.short[1], 7, yt + 39);
 
     // ── Emission-delay bar ───────────────────────────────────
-    ctx.fillStyle = '#0a0a0c';
+    ctx.fillStyle = '#08080c';
     ctx.fillRect(sx, yb, scopeWidth - sx, H_LEGEND);
 
     if (msPerBin === 0) return;
@@ -274,19 +304,13 @@ function resizeCanvas() {
     canvas.width  = w;
     canvas.height = NCH * ROW_HEIGHT;
 
-    // Base fill
-    ctx.fillStyle = '#050507';
+    ctx.fillStyle = '#08080c';
     ctx.fillRect(0, 0, w, canvas.height);
 
     for (let i = 0; i < NCH; i++) {
-        // Subtle alternating row tint
-        if (i % 2 === 1) {
-            ctx.fillStyle = 'rgba(255,255,255,0.015)';
-            ctx.fillRect(0, rowTop(i), w, ROW_HEIGHT);
-        }
         // Row separator
         if (i > 0) {
-            ctx.strokeStyle = '#1e1e24';
+            ctx.strokeStyle = '#22222a';
             ctx.lineWidth = 1;
             ctx.beginPath();
             ctx.moveTo(0, rowTop(i) - 0.5);
