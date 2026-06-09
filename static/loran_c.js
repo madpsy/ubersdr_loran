@@ -251,10 +251,10 @@ function handleJsonMessage(msg) {
                         channelQuality[q.ch_idx] = q;
                     }
                 });
-                // Redraw all legends — SNR change may affect dim overlay
-                for (let i = 0; i < NCH; i++) {
-                    if (channelQuality[i] !== undefined) drawLegend(i);
-                }
+                // Do NOT redraw legends here — handleBinary() redraws them at
+                // ~10 Hz on every scope frame, so forcing a redraw here causes
+                // a visible flash every second.  The updated SNR values will be
+                // picked up naturally on the next scope frame.
             }
             break;
         }
@@ -299,6 +299,10 @@ function handleBinary(buf) {
     const data  = ba.slice(5);
     if (chIdx < 0 || chIdx >= NCH) return;
     nbuckets[chIdx] = data.length;
+    // Draw legend first (left margin + emission bar) so the trace overwrites
+    // only the trace area, not the legend.  This also keeps the SNR badge
+    // current without needing a separate redraw from quality_update.
+    drawLegend(chIdx);
     drawScope(chIdx, cmd, data);
     // Redraw peak markers on top of fresh trace
     drawPeakMarkers(chIdx);
@@ -321,7 +325,6 @@ function drawScope(chIdx, cmd, data) {
     if (cmd === CMD_SCOPE_RESET) {
         ctx.fillStyle = BG;
         ctx.fillRect(sx, rowTop(chIdx), scopeWidth - sx, yh);
-        drawLegend(chIdx);
     }
 
     const blen = data.length;
