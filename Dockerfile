@@ -35,10 +35,10 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 USER loran
 
-# Expose the scope web UI port (default 8095; override with WEB_PORT env var)
-EXPOSE 8095
+# Expose the scope web UI port (default 6088; override with WEB_PORT env var)
+EXPOSE 6088
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["/usr/bin/wget", "-q", "-O", "/dev/null", "http://localhost:8095/"]
+    CMD ["/usr/bin/wget", "-q", "-O", "/dev/null", "http://localhost:6088/"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

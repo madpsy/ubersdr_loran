@@ -88,7 +88,7 @@ This will:
 2. Download `docker-compose.yml` and helper scripts
 3. Pull the Docker image and start the container
 
-The scope UI will be available at **http://localhost:8095/**
+The scope UI will be available at **http://localhost:6088/**
 
 ### UberSDR addon proxy configuration
 
@@ -98,7 +98,7 @@ Add the following in the UberSDR Admin → Addon Proxies:
 |-------|-------|
 | Name | `loran` |
 | Host | `loran` |
-| Port | `8095` |
+| Port | `6088` |
 | Enabled | ✅ |
 | Strip prefix | ✅ |
 | Rewrite WebSocket origin | ❌ |

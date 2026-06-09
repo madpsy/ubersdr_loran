@@ -89,7 +89,7 @@ run_image() {
 
     docker run --rm -it \
         --platform "$PLATFORM" \
-        -p "${WEB_PORT:-8095}:${WEB_PORT:-8095}" \
+        -p "${WEB_PORT:-6088}:${WEB_PORT:-6088}" \
         "${args[@]}" \
         "$IMAGE" \
         "${@}"

@@ -46,6 +46,9 @@ const iqMode = "iq"
 // iqSampleRate is the sample rate delivered by the "iq" mode.
 const iqSampleRate = 10000
 
+// defaultWebPort is the default port for the scope web UI.
+const defaultWebPort = 6088
+
 const rcvBufSize = 4 * 1024 * 1024 // 4 MiB SO_RCVBUF
 
 // wsDialer sets SO_RCVBUF on the underlying TCP socket before the WebSocket handshake.
@@ -461,7 +464,7 @@ func main() {
 	var (
 		rawURL    = flag.String("url", "", "UberSDR base URL, e.g. http://host:8080 (required)")
 		pass      = flag.String("pass", "", "Bypass password (optional)")
-		webPort   = flag.Int("web-port", 8095, "Port for the Loran-C scope web UI")
+		webPort   = flag.Int("web-port", defaultWebPort, "Port for the Loran-C scope web UI")
 		webStatic = flag.String("web-static", "./static", "Path to static web files directory")
 		noReconn  = flag.Bool("no-reconnect", false, "Disable auto-reconnect on disconnect")
 	)
@@ -470,7 +473,7 @@ func main() {
 	if *rawURL == "" {
 		fmt.Fprintf(os.Stderr, "Usage: ubersdr_loran -url <http://host:port> [-pass <password>] [-web-port <port>] [-web-static <path>] [-no-reconnect]\n\n")
 		fmt.Fprintf(os.Stderr, "  Connects to UberSDR at 100 kHz (Loran-C carrier) using IQ mode (%d Hz sample rate)\n", iqSampleRate)
-		fmt.Fprintf(os.Stderr, "  and serves a Loran-C pulse-envelope scope at http://localhost:%d/\n", 8095)
+		fmt.Fprintf(os.Stderr, "  and serves a Loran-C pulse-envelope scope at http://localhost:%d/\n", defaultWebPort)
 		os.Exit(1)
 	}
 

@@ -9,5 +9,5 @@ cd "${INSTALL_DIR}"
 echo "Starting ubersdr_loran..."
 docker compose up -d --remove-orphans
 echo "Done."
-echo "  Scope UI  : http://localhost:8095/"
+echo "  Scope UI  : http://localhost:6088/"
 echo "  View logs : docker compose logs -f"
