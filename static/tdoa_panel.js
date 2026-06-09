@@ -24,8 +24,9 @@
 
 const BASE_PATH = (typeof window.BASE_PATH === 'string') ? window.BASE_PATH : '';
 
-// Poll interval (ms)
-const POLL_MS = 1000;
+// Poll interval (ms).
+// Kept at 5 s to stay within the UberSDR reverse-proxy rate limit.
+const POLL_MS = 5000;
 
 // SNR thresholds (dB)
 const SNR_GOOD = 15;

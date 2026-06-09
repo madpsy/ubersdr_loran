@@ -98,8 +98,57 @@ function rowBottom(i) { return (i + 1) * ROW_HEIGHT - H_LEGEND; }
 function scopeH()     { return ROW_HEIGHT - H_LEGEND; }
 
 // ---------------------------------------------------------------------------
-// Quality polling — keeps SNR badges fresh (server may not push quality_update)
+// UTC clock — polls GET /api/timing and updates #utc-time in the header.
+// The server returns the PCM wall-clock timestamp (NTP ±1–10 ms).
+// Between polls the display is advanced by a local JS timer so it ticks
+// smoothly every second without hammering the API.
 // ---------------------------------------------------------------------------
+
+const TIMING_POLL_MS = 5000; // REST poll interval (rate-limit friendly)
+
+let utcOffsetMs = 0;      // difference: server UTC ms - Date.now() at last poll
+let utcValid    = false;  // true once first timing poll succeeds
+let utcTicker   = null;   // setInterval handle for the 1-second display tick
+
+async function pollTiming() {
+    try {
+        const resp = await fetch(BASE_PATH + '/api/timing');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (!data.valid) return;
+        // data.utc is RFC3339, e.g. "2026-06-09T11:45:00.123Z"
+        const serverMs = new Date(data.utc).getTime();
+        utcOffsetMs = serverMs - Date.now();
+        utcValid    = true;
+        updateUtcDisplay();
+    } catch (e) { /* ignore */ }
+}
+
+function updateUtcDisplay() {
+    const el = document.getElementById('utc-time');
+    if (!el) return;
+    if (!utcValid) { el.textContent = '--:--:--.---'; return; }
+    const now = new Date(Date.now() + utcOffsetMs);
+    const hh  = String(now.getUTCHours()).padStart(2, '0');
+    const mm  = String(now.getUTCMinutes()).padStart(2, '0');
+    const ss  = String(now.getUTCSeconds()).padStart(2, '0');
+    const ms  = String(now.getUTCMilliseconds()).padStart(3, '0');
+    el.textContent = `${hh}:${mm}:${ss}.${ms}`;
+}
+
+function startUtcClock() {
+    pollTiming();
+    setInterval(pollTiming, TIMING_POLL_MS);
+    // Tick the display every 100 ms for smooth millisecond updates
+    utcTicker = setInterval(updateUtcDisplay, 100);
+}
+
+// ---------------------------------------------------------------------------
+// Quality polling — keeps SNR badges fresh (server may not push quality_update)
+// Polled at 5 s to stay well within the UberSDR reverse-proxy rate limit.
+// ---------------------------------------------------------------------------
+
+const QUALITY_POLL_MS = 5000;
 
 async function pollQuality() {
     if (NCH === 0) return; // not yet bootstrapped
@@ -152,9 +201,12 @@ async function bootstrap() {
 
         connect();
 
-        // Poll quality endpoint to keep SNR badges fresh (1 Hz)
+        // Start UTC clock display
+        startUtcClock();
+
+        // Poll quality endpoint to keep SNR badges fresh
         pollQuality();
-        setInterval(pollQuality, 1000);
+        setInterval(pollQuality, QUALITY_POLL_MS);
 
         // Initialise sibling modules after chains are available
         if (typeof window.mapInit === 'function') {

@@ -30,8 +30,9 @@ const TILE_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">Open
 // Station colour palette (matches loran_c.js STATION_COLORS)
 const STATION_COLORS = ['#e74c3c', '#f1c40f', '#2ecc71', '#3498db', '#95a5a6'];
 
-// Poll interval for REST endpoints (ms)
-const POLL_MS = 1000;
+// Poll interval for REST endpoints (ms).
+// Kept at 5 s to stay within the UberSDR reverse-proxy rate limit.
+const POLL_MS = 5000;
 
 // ---------------------------------------------------------------------------
 // State
@@ -43,16 +44,21 @@ let initialised = false;
 // Transmitter markers: key = "GRI_stationId"
 const txMarkers = {};
 
-// Receiver marker
-let rxMarker = null;
+// Receiver marker (known position from /api/description)
+let rxMarker   = null;
+let rxLat      = 0;
+let rxLon      = 0;
 
 // LOP polylines: key = lopKey (GRI + "_" + secId)
 const lopLines = {};
 
-// Fix marker
-let fixMarker = null;
-let fixCircle = null;
-let firstFix  = true;
+// Fix marker (Loran-computed position)
+let fixMarker  = null;
+let fixCircle  = null;
+let firstFix   = true;
+
+// Error line between known position and Loran fix
+let errorLine  = null;
 
 // ---------------------------------------------------------------------------
 // Initialise map
@@ -73,6 +79,9 @@ function initMap() {
         attribution: TILE_ATTR,
         maxZoom: 18,
     }).addTo(map);
+
+    // Fetch receiver position immediately (may also arrive via WS receiver_pos)
+    fetchReceiverPos();
 
     // Start polling REST endpoints
     pollLOPs();
@@ -133,12 +142,43 @@ function placeTransmitterMarkers(chains, traceColors) {
 // Receiver marker
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Haversine distance (km) between two lat/lon points
+// ---------------------------------------------------------------------------
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+    const R  = 6371.0;
+    const dL = (lat2 - lat1) * Math.PI / 180;
+    const dl = (lon2 - lon1) * Math.PI / 180;
+    const a  = Math.sin(dL/2)**2 +
+               Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180) *
+               Math.sin(dl/2)**2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// ---------------------------------------------------------------------------
+// Receiver marker (known GPS position from /api/description)
+// ---------------------------------------------------------------------------
+
+async function fetchReceiverPos() {
+    try {
+        const resp = await fetch(BASE_PATH + '/api/receiver');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (data.lat && data.lon) setReceiverPos(data.lat, data.lon);
+    } catch (e) { /* ignore */ }
+}
+
 function setReceiverPos(lat, lon) {
     if (!map) return;
     if (lat === 0 && lon === 0) return;
 
+    rxLat = lat;
+    rxLon = lon;
+
     if (rxMarker) {
         rxMarker.setLatLng([lat, lon]);
+        rxMarker.setTooltipContent(buildRxTooltip(lat, lon));
     } else {
         rxMarker = L.circleMarker([lat, lon], {
             radius:      9,
@@ -149,14 +189,53 @@ function setReceiverPos(lat, lon) {
             opacity:     1,
         }).addTo(map);
 
-        rxMarker.bindTooltip(
-            `<b>Receiver</b><br>${lat.toFixed(5)}°, ${lon.toFixed(5)}°`,
+        rxMarker.bindTooltip(buildRxTooltip(lat, lon),
             { direction: 'top', offset: [0, -8], permanent: false }
         );
 
         // Pan to receiver on first placement
         map.setView([lat, lon], 5, { animate: true });
     }
+
+    // Redraw error line if fix is already known
+    updateErrorLine();
+}
+
+function buildRxTooltip(lat, lon) {
+    return `<b>📡 Known position</b><br>` +
+           `${lat.toFixed(5)}°, ${lon.toFixed(5)}°<br>` +
+           `<span style="color:#6b6b7a;font-size:10px">From /api/description (GPS)</span>`;
+}
+
+// ---------------------------------------------------------------------------
+// Error line between known position and Loran fix
+// ---------------------------------------------------------------------------
+
+function updateErrorLine() {
+    if (!map) return;
+    if (!rxLat || !rxLon) { hideErrorLine(); return; }
+    if (!fixMarker) { hideErrorLine(); return; }
+    const fixLL = fixMarker.getLatLng();
+    if (!fixLL) { hideErrorLine(); return; }
+
+    const latLngs = [[rxLat, rxLon], [fixLL.lat, fixLL.lng]];
+
+    if (errorLine) {
+        errorLine.setLatLngs(latLngs);
+        errorLine.setStyle({ opacity: 0.8 });
+    } else {
+        errorLine = L.polyline(latLngs, {
+            color:     '#f59e0b',
+            weight:    2,
+            opacity:   0.8,
+            dashArray: '5 4',
+        }).addTo(map);
+        errorLine.bindTooltip('Error vector (known → Loran fix)', { sticky: true });
+    }
+}
+
+function hideErrorLine() {
+    if (errorLine) errorLine.setStyle({ opacity: 0 });
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +303,7 @@ function updateFix(fix) {
             fixMarker.setOpacity(0.3);
             if (fixCircle) fixCircle.setStyle({ opacity: 0.1, fillOpacity: 0.05 });
         }
+        hideErrorLine();
         document.getElementById('fix-badge').textContent = 'No fix';
         document.getElementById('fix-badge').style.color = '';
         return;
@@ -231,6 +311,11 @@ function updateFix(fix) {
 
     const lat = fix.lat;
     const lon = fix.lon;
+
+    // Compute error distance from known receiver position
+    const errKm = (rxLat && rxLon)
+        ? haversineKm(rxLat, rxLon, lat, lon)
+        : null;
 
     if (fixMarker) {
         fixMarker.setLatLng([lat, lon]);
@@ -240,7 +325,7 @@ function updateFix(fix) {
             fixCircle.setStyle({ opacity: 0.6, fillOpacity: 0.15 });
         }
     } else {
-        // Accuracy circle (rough estimate: 5 km radius placeholder)
+        // Accuracy circle (~5 km radius)
         fixCircle = L.circle([lat, lon], {
             radius:      5000,
             color:       '#22c55e',
@@ -260,18 +345,29 @@ function updateFix(fix) {
             opacity:     1,
         }).addTo(map);
 
-        fixMarker.bindPopup(buildFixPopup(fix), { maxWidth: 220 });
+        fixMarker.bindPopup(buildFixPopup(fix, errKm), { maxWidth: 240 });
     }
 
     // Update popup content
     if (fixMarker.isPopupOpen()) {
-        fixMarker.getPopup().setContent(buildFixPopup(fix));
+        fixMarker.getPopup().setContent(buildFixPopup(fix, errKm));
     }
 
-    // Update badge
+    // Update badge — show error distance if known position available
     const badge = document.getElementById('fix-badge');
-    badge.textContent = `${lat.toFixed(4)}°, ${lon.toFixed(4)}°`;
+    if (errKm !== null) {
+        const errStr = errKm < 1
+            ? (errKm * 1000).toFixed(0) + ' m error'
+            : errKm.toFixed(1) + ' km error';
+        badge.textContent = errStr;
+        badge.title = `Loran fix: ${lat.toFixed(4)}°, ${lon.toFixed(4)}°`;
+    } else {
+        badge.textContent = `${lat.toFixed(4)}°, ${lon.toFixed(4)}°`;
+    }
     badge.style.color = '#22c55e';
+
+    // Draw error line between known position and Loran fix
+    updateErrorLine();
 
     // Auto-zoom on first valid fix
     if (firstFix) {
@@ -280,16 +376,22 @@ function updateFix(fix) {
     }
 }
 
-function buildFixPopup(fix) {
+function buildFixPopup(fix, errKm) {
     const residStr = fix.residual_us !== undefined
         ? fix.residual_us.toFixed(1) + ' µs'
         : '?';
     const hdopStr = fix.hdop !== undefined
         ? fix.hdop.toFixed(2)
         : '?';
-    return `<b>Position Fix</b><br>` +
+    const errStr = errKm !== null && errKm !== undefined
+        ? (errKm < 1
+            ? (errKm * 1000).toFixed(0) + ' m'
+            : errKm.toFixed(2) + ' km')
+        : '?';
+    return `<b>🟢 Loran fix</b><br>` +
            `Lat: ${fix.lat.toFixed(5)}°<br>` +
            `Lon: ${fix.lon.toFixed(5)}°<br>` +
+           `Error vs known: <b>${errStr}</b><br>` +
            `Residual: ${residStr}<br>` +
            `HDOP: ${hdopStr}<br>` +
            `LOPs used: ${fix.n_lops || '?'}`;
