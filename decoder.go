@@ -135,12 +135,19 @@ func (d *LoranDecoder) SetGRI(ch int, gri uint32) {
 
 // SetOffset mirrors: sscanf(msg, "SET offset%d=%d", &ch, &offset)
 // c->offset = (c->offset + offset) % c->nbucket; c->restart = true
+//
+// In C++, c->offset is int and c->nbucket is u4_t.  The expression
+// (c->offset + offset) % c->nbucket converts the left side to u4_t before
+// the modulo, so the result is always in [0, nbucket).  We replicate this
+// by converting to uint32 before the modulo and back to int.
 func (d *LoranDecoder) SetOffset(ch int, delta int) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	c := &d.ch[ch]
 	if c.nbucket > 0 {
-		c.offset = (c.offset + delta) % int(c.nbucket)
+		// Match C++ unsigned modulo: (uint32)(c->offset + offset) % c->nbucket
+		sum := uint32(c.offset + delta)
+		c.offset = int(sum % c.nbucket)
 	}
 	c.restart = true
 }
