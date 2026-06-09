@@ -46,8 +46,10 @@ const (
 
 	// minSNRdB is the minimum SNR (dB) required before a peak is considered
 	// valid for TDOA measurement.  Below this threshold the measurement is
-	// marked invalid.
-	minSNRdB = 3.0
+	// marked invalid.  3 dB is too low — noise peaks routinely exceed it.
+	// 8 dB matches the SNR_WARN threshold used in the UI and is a practical
+	// "we can actually hear this station" floor.
+	minSNRdB = 8.0
 )
 
 // ---------------------------------------------------------------------------
@@ -118,6 +120,26 @@ func (e *TDOAEngine) Update() {
 		// The master station is always the first entry in chain.Stations.
 		// Subsequent entries are secondaries with known emission delays.
 		if len(chain.Stations) < 2 {
+			continue
+		}
+
+		// Gate on master channel quality: if the decoder's averaged SNR for
+		// this channel is below threshold, the master is not heard and no
+		// secondary measurement from this chain can be trusted.
+		if qual.SNR < minSNRdB {
+			// Emit invalid measurements so the UI still shows the chain rows
+			masterStation := chain.Stations[0]
+			for _, sec := range chain.Stations[1:] {
+				results = append(results, TDOAMeasurement{
+					ChainGRI:    chain.GRI,
+					ChainName:   chain.Name,
+					MasterID:    masterStation.ID,
+					SecondaryID: sec.ID,
+					EmissionUS:  sec.DelayUS,
+					Valid:       false,
+					UpdatedAt:   now,
+				})
+			}
 			continue
 		}
 

@@ -135,6 +135,28 @@ function startUtcClock() {
 }
 
 // ---------------------------------------------------------------------------
+// "Heard only" filter — driven by #valid-only checkbox
+// ---------------------------------------------------------------------------
+
+function heardOnly() {
+    const cb = document.getElementById('valid-only');
+    return cb ? cb.checked : false;
+}
+
+// Returns true if channel chIdx has a master SNR above the warning threshold
+// (i.e. we can actually hear it).
+function isChannelHeard(chIdx) {
+    const q = channelQuality[chIdx];
+    if (!q || q.snr_db === undefined) return false;
+    return q.snr_db >= SNR_WARN;
+}
+
+// Re-draw all legends (called when checkbox toggles)
+function redrawAllLegends() {
+    for (let i = 0; i < NCH; i++) drawLegend(i);
+}
+
+// ---------------------------------------------------------------------------
 // Bootstrap — fetch config then connect
 // ---------------------------------------------------------------------------
 
@@ -160,6 +182,12 @@ async function bootstrap() {
         resizeCanvas();
         window.addEventListener('resize', resizeCanvas);
         canvas.addEventListener('click', onCanvasClick);
+
+        // Wire "heard only" checkbox — redraw all legends on toggle
+        const validOnlyCb = document.getElementById('valid-only');
+        if (validOnlyCb) {
+            validOnlyCb.addEventListener('change', redrawAllLegends);
+        }
 
         connect();
 
@@ -249,9 +277,12 @@ function handleJsonMessage(msg) {
                 qArr.forEach(q => {
                     if (q.ch_idx !== undefined) {
                         channelQuality[q.ch_idx] = q;
-                        if (q.ch_idx < NCH) drawLegend(q.ch_idx);
                     }
                 });
+                // Redraw all legends — SNR change may affect dim overlay
+                for (let i = 0; i < NCH; i++) {
+                    if (channelQuality[i] !== undefined) drawLegend(i);
+                }
             }
             break;
         }
@@ -483,9 +514,9 @@ function drawLegend(chIdx) {
     ctx.fillStyle = color;
     ctx.fillText('GRI ' + chain.gri, 7, yt + 14);
 
-    // Chain name lines — muted
+    // Chain name lines — white
     ctx.font = '10px "Inter", system-ui, sans-serif';
-    ctx.fillStyle = '#808090';
+    ctx.fillStyle = '#c8c8d8';
     ctx.fillText(chain.short[0], 7, yt + 27);
     if (chain.short[1]) ctx.fillText(chain.short[1], 7, yt + 39);
 
@@ -514,7 +545,16 @@ function drawLegend(chIdx) {
     ctx.fillStyle = '#08080c';
     ctx.fillRect(sx, yb, scopeWidth - sx, H_LEGEND);
 
-    if (msPerBin === 0 || !chain.stations || chain.stations.length === 0) return;
+    if (msPerBin === 0 || !chain.stations || chain.stations.length === 0) {
+        // Still apply dim overlay even if no station data
+        if (heardOnly() && !isChannelHeard(chIdx)) {
+            ctx.fillStyle = '#08080c';
+            ctx.globalAlpha = 0.72;
+            ctx.fillRect(0, yt, scopeWidth, ROW_HEIGHT);
+            ctx.globalAlpha = 1.0;
+        }
+        return;
+    }
 
     const stations = chain.stations;
     for (let i = 0; i < stations.length; i++) {
@@ -534,6 +574,16 @@ function drawLegend(chIdx) {
         ctx.font = '9px "Inter", system-ui, sans-serif';
         ctx.fillStyle = '#c0c0cc';
         ctx.fillText(st.id + ' ' + st.name, sx + ed0 + 2, yb + H_LEGEND - 4);
+    }
+
+    // ── "Heard only" dim overlay ─────────────────────────────
+    // When the filter is active and this channel is below SNR threshold,
+    // overlay a translucent dark rectangle over the entire row.
+    if (heardOnly() && !isChannelHeard(chIdx)) {
+        ctx.fillStyle = '#08080c';
+        ctx.globalAlpha = 0.72;
+        ctx.fillRect(0, yt, scopeWidth, ROW_HEIGHT);
+        ctx.globalAlpha = 1.0;
     }
 }
 

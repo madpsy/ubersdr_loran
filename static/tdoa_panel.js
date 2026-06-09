@@ -95,6 +95,11 @@ function griToChIdx(gri) {
 // Render table
 // ---------------------------------------------------------------------------
 
+function heardOnly() {
+    const cb = document.getElementById('valid-only');
+    return cb ? cb.checked : false;
+}
+
 function renderTable(measurements) {
     const tbody = document.getElementById('tdoa-tbody');
     if (!tbody) return;
@@ -105,8 +110,17 @@ function renderTable(measurements) {
         return;
     }
 
+    // Optionally filter to only heard (valid) measurements
+    const filtered = heardOnly() ? measurements.filter(m => m.valid) : measurements;
+
+    if (filtered.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" class="val-muted" ' +
+            'style="padding:12px 10px;text-align:center">No heard stations yet…</td></tr>';
+        return;
+    }
+
     // Sort by GRI then secondary_id
-    const sorted = measurements.slice().sort((a, b) => {
+    const sorted = filtered.slice().sort((a, b) => {
         if (a.chain_gri !== b.chain_gri) return a.chain_gri - b.chain_gri;
         return (a.secondary_id || '').localeCompare(b.secondary_id || '');
     });
@@ -188,6 +202,12 @@ function onWsMessage(msg) {
 // ---------------------------------------------------------------------------
 
 window.tdoaPanelInit = function () {
+    // Re-render table immediately when the "heard only" checkbox is toggled
+    const cb = document.getElementById('valid-only');
+    if (cb) {
+        cb.addEventListener('change', () => renderTable(latestTDOA));
+    }
+
     // Subscribe to WS messages — all data arrives via push, no REST polling
     if (typeof window.loranWsSubscribe === 'function') {
         window.loranWsSubscribe(onWsMessage);

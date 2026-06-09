@@ -27,9 +27,6 @@ const BASE_PATH = (typeof window.BASE_PATH === 'string') ? window.BASE_PATH : ''
 const TILE_URL = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
 const TILE_ATTR = '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors';
 
-// Station colour palette (matches loran_c.js STATION_COLORS)
-const STATION_COLORS = ['#e74c3c', '#f1c40f', '#2ecc71', '#3498db', '#95a5a6'];
-
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -56,9 +53,58 @@ let firstFix   = true;
 // Error line between known position and Loran fix
 let errorLine  = null;
 
+// GRIs that have at least one valid TDOA measurement (i.e. we can hear them)
+const heardGRIs = new Set();
+
+// Latest LOP array — kept so we can re-apply filter on checkbox toggle
+let latestLops = null;
+
+// SNR per station: key = "GRI_stationId", value = snr_db (number or null)
+const txSNR = {};
+
+// Station metadata: key = "GRI_stationId", value = {id, name}
+const txMeta = {};
+
 // ---------------------------------------------------------------------------
 // Initialise map
 // ---------------------------------------------------------------------------
+
+function heardOnly() {
+    const cb = document.getElementById('valid-only');
+    return cb ? cb.checked : false;
+}
+
+// Apply/remove the "heard only" filter to transmitter markers.
+// A chain is "heard" if heardGRIs contains its GRI.
+function applyHeardFilter() {
+    const filter = heardOnly();
+    const chains = window.loranChains;
+    if (!chains) return;
+
+    chains.forEach(chain => {
+        const heard = heardGRIs.has(chain.gri);
+        if (!chain.stations) return;
+        chain.stations.forEach((st, stIdx) => {
+            const key = chain.gri + '_' + st.id;
+            const marker = txMarkers[key];
+            if (!marker) return;
+            if (filter && !heard) {
+                marker.setStyle({ opacity: 0.15, fillOpacity: 0.08 });
+            } else {
+                const isMaster = stIdx === 0;
+                marker.setStyle({
+                    opacity:     1,
+                    fillOpacity: isMaster ? 0.9 : 0.55,
+                });
+            }
+        });
+    });
+
+    // Re-apply LOP filter with cached data
+    if (latestLops !== null) {
+        updateLOPs(latestLops, window.loranChains, window.loranTraceColors);
+    }
+}
 
 function initMap() {
     if (initialised) return;
@@ -79,6 +125,10 @@ function initMap() {
     // Fetch receiver position immediately (may also arrive via WS receiver_pos)
     fetchReceiverPos();
 
+    // Wire "heard only" checkbox
+    const cb = document.getElementById('valid-only');
+    if (cb) cb.addEventListener('change', applyHeardFilter);
+
     // Subscribe to WS JSON messages
     if (typeof window.loranWsSubscribe === 'function') {
         window.loranWsSubscribe(onWsMessage);
@@ -96,32 +146,86 @@ function initMap() {
 // Place transmitter markers from chain data
 // ---------------------------------------------------------------------------
 
+// Build the permanent label text for a transmitter marker.
+// Shows: "ID Name  X.X dB" (SNR omitted if not yet known)
+function buildTxLabel(id, name, snr) {
+    const snrStr = (snr !== null && snr !== undefined && !isNaN(snr))
+        ? `  <span style="opacity:0.7">${snr.toFixed(1)} dB</span>`
+        : '';
+    return `<b>${id}</b> ${name}${snrStr}`;
+}
+
+// Build the click popup content for a transmitter marker.
+function buildTxPopup(meta, snr) {
+    const role = meta.isMaster ? '📡 Master' : '📡 Secondary';
+    const hasSnr = snr !== null && snr !== undefined && !isNaN(snr);
+    const snrStr = hasSnr ? `${snr.toFixed(1)} dB` : '—';
+    const snrColor = !hasSnr ? '#888'
+        : snr >= 15 ? '#22c55e'
+        : snr >= 8  ? '#f59e0b'
+        : '#ef4444';
+    return `<b>${role}: ${meta.id}</b><br>` +
+           `${meta.name}<br>` +
+           `<span style="color:#888">GRI ${meta.gri} — ${meta.chainName}</span><br>` +
+           `${meta.lat.toFixed(4)}°, ${meta.lon.toFixed(4)}°<br>` +
+           `SNR: <b style="color:${snrColor}">${snrStr}</b>`;
+}
+
+// Update the permanent label and popup for a single marker key with latest SNR.
+function updateTxTooltip(key) {
+    const marker = txMarkers[key];
+    if (!marker) return;
+    const meta = txMeta[key];
+    if (!meta) return;
+    const snr = txSNR[key] !== undefined ? txSNR[key] : null;
+    marker.setTooltipContent(buildTxLabel(meta.id, meta.name, snr));
+    if (marker.getPopup()) {
+        marker.setPopupContent(buildTxPopup(meta, snr));
+    }
+}
+
 function placeTransmitterMarkers(chains, traceColors) {
     if (!map) return;
     chains.forEach((chain, chIdx) => {
-        const traceColor = traceColors[chIdx % traceColors.length];
+        // Use the same trace colour as the scope row for this chain
+        const color = traceColors[chIdx % traceColors.length];
         if (!chain.stations) return;
         chain.stations.forEach((st, stIdx) => {
             if (!st.lat || !st.lon || (st.lat === 0 && st.lon === 0)) return;
             const key = chain.gri + '_' + st.id;
-            if (txMarkers[key]) return; // already placed
 
-            const color = STATION_COLORS[stIdx % STATION_COLORS.length];
             const isMaster = stIdx === 0;
+
+            // Store full metadata for label/popup updates
+            txMeta[key] = {
+                id:        st.id,
+                name:      st.name,
+                gri:       chain.gri,
+                chainName: chain.name || ('GRI ' + chain.gri),
+                lat:       st.lat,
+                lon:       st.lon,
+                isMaster:  isMaster,
+            };
+
+            if (txMarkers[key]) return; // already placed
 
             const marker = L.circleMarker([st.lat, st.lon], {
                 radius:      isMaster ? 7 : 5,
                 color:       color,
                 fillColor:   color,
-                fillOpacity: isMaster ? 0.9 : 0.7,
-                weight:      isMaster ? 2 : 1,
+                fillOpacity: isMaster ? 0.9 : 0.55,
+                weight:      isMaster ? 2.5 : 1.5,
                 opacity:     1,
             }).addTo(map);
 
+            // Permanent label to the right of the marker
             marker.bindTooltip(
-                `<b>${st.id}</b> ${st.name}`,
-                { direction: 'top', offset: [0, -8], permanent: true, className: 'tx-label' }
+                buildTxLabel(st.id, st.name, null),
+                { direction: 'right', offset: [6, 0], permanent: true, className: 'tx-label' }
             );
+
+            // Click popup with full details
+            marker.bindPopup(buildTxPopup(txMeta[key], null), { maxWidth: 220 });
 
             txMarkers[key] = marker;
         });
@@ -235,12 +339,19 @@ function hideErrorLine() {
 function updateLOPs(lops, chains, traceColors) {
     if (!map || !lops) return;
 
+    // Cache for re-application when checkbox toggles
+    latestLops = lops;
+
+    const filter = heardOnly();
+
     // Track which keys are still active
     const activeKeys = new Set();
 
     lops.forEach(lop => {
         if (!lop.points || lop.points.length < 2) return;
         if (!lop.valid) return;
+        // When "heard only" is active, skip LOPs for chains we haven't heard
+        if (filter && !heardGRIs.has(lop.chain_gri)) return;
 
         // LOP JSON fields: chain_gri, secondary_id, tdoa_us, points
         const gri = lop.chain_gri;
@@ -396,6 +507,42 @@ function onWsMessage(msg) {
         case 'receiver_pos':
             setReceiverPos(msg.lat, msg.lon);
             break;
+
+        case 'quality_update': {
+            // Update master station SNR labels.
+            // quality_update channels are indexed by ch_idx which maps to chain index.
+            const channels = msg.channels || msg.quality;
+            const chains = window.loranChains;
+            if (Array.isArray(channels) && chains) {
+                channels.forEach(q => {
+                    if (q.ch_idx === undefined || q.ch_idx >= chains.length) return;
+                    const chain = chains[q.ch_idx];
+                    if (!chain || !chain.stations || chain.stations.length === 0) return;
+                    // Master is stations[0]
+                    const masterId = chain.stations[0].id;
+                    const key = chain.gri + '_' + masterId;
+                    txSNR[key] = q.snr_db;
+                    updateTxTooltip(key);
+                });
+            }
+            break;
+        }
+
+        case 'tdoa_update':
+            // Track which GRIs have at least one valid measurement (i.e. we can hear them)
+            if (Array.isArray(msg.measurements)) {
+                heardGRIs.clear();
+                msg.measurements.forEach(m => {
+                    if (m.valid) heardGRIs.add(m.chain_gri);
+                    // Update secondary station SNR label
+                    const key = m.chain_gri + '_' + m.secondary_id;
+                    txSNR[key] = m.snr_db;
+                    updateTxTooltip(key);
+                });
+                applyHeardFilter();
+            }
+            break;
+
         case 'lop_update':
             if (msg.lops) {
                 updateLOPs(msg.lops, window.loranChains, window.loranTraceColors);
