@@ -114,7 +114,9 @@ function recomputeDisplayOrder() {
         if (snr >= SNR_GOOD) heard.push({ ch: i, snr });
         else                 unheard.push({ ch: i, snr });
     }
-    heard.sort((a, b) => b.snr - a.snr);
+    // Sort both groups by channel index for a stable, non-jumping order.
+    // SNR is used only to decide heard vs unheard, not to rank within the group.
+    heard.sort((a, b) => a.ch - b.ch);
     unheard.sort((a, b) => a.ch - b.ch);
 
     const newOrder = [...heard.map(x => x.ch), ...unheard.map(x => x.ch)];
@@ -577,15 +579,17 @@ function drawLegend(chIdx) {
     }
 
     // ── Auto-track status ─────────────────────────────────────
-    // Show tracking state below the SNR badge.
-    // delta=0 → locked (master peak is within hysteresis of target).
-    // delta≠0 → adjusting (number of bins the window was shifted this cycle).
-    const trackDelta = channelTrackDelta[chIdx];
-    if (trackDelta !== undefined) {
+    // track_deltas from server: null = not yet tracked, 0 = aligned, N = just adjusted N bins.
+    // channelTrackDelta[chIdx] mirrors this: undefined = no data yet, null = not tracked,
+    // 0 = aligned, non-zero = just adjusted.
+    if (chIdx in channelTrackDelta) {
+        const trackDelta = channelTrackDelta[chIdx];
         ctx.font = '9px "Inter", system-ui, sans-serif';
-        if (trackDelta === 0) {
+        if (trackDelta === null) {
+            // Master not yet heard — no status shown
+        } else if (trackDelta === 0) {
             ctx.fillStyle = '#22c55e';
-            ctx.fillText('⟳ locked', 7, yt + 68);
+            ctx.fillText('⟳ aligned', 7, yt + 68);
         } else {
             ctx.fillStyle = '#f59e0b';
             const sign = trackDelta > 0 ? '+' : '';

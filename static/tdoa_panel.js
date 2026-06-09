@@ -119,23 +119,14 @@ function renderTable(measurements) {
         return;
     }
 
-    // Sort: heard (valid) rows first by master SNR descending, then unheard
-    // rows by GRI ascending.  Within the heard group, secondary_id breaks ties.
-    const getMasterSNR = m => {
-        const chIdx = griToChIdx(m.chain_gri);
-        const q = chIdx >= 0 ? qualityMap[chIdx] : null;
-        return (q && q.snr_db !== undefined) ? q.snr_db : -Infinity;
-    };
+    // Sort: heard (valid) rows first, then unheard rows.
+    // Within each group sort by GRI ascending then secondary_id — stable order
+    // that doesn't jump as SNR fluctuates with propagation.
     const sorted = filtered.slice().sort((a, b) => {
         const aHeard = a.valid ? 1 : 0;
         const bHeard = b.valid ? 1 : 0;
         if (aHeard !== bHeard) return bHeard - aHeard; // heard first
-        if (aHeard) {
-            // Both heard: sort by master SNR descending
-            const snrDiff = getMasterSNR(b) - getMasterSNR(a);
-            if (Math.abs(snrDiff) > 0.01) return snrDiff;
-        }
-        // Fallback: GRI ascending, then secondary_id
+        // Both in same group: GRI ascending, then secondary_id
         if (a.chain_gri !== b.chain_gri) return a.chain_gri - b.chain_gri;
         return (a.secondary_id || '').localeCompare(b.secondary_id || '');
     });

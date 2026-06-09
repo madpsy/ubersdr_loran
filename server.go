@@ -250,7 +250,7 @@ func (s *ScopeServer) buildPushFrames() [][]byte {
 		s.tdoaMu.RLock()
 		tdoaEngQ := s.tdoaEng
 		s.tdoaMu.RUnlock()
-		var trackDeltas []int
+		var trackDeltas []*int
 		if tdoaEngQ != nil {
 			trackDeltas = tdoaEngQ.TrackDeltas()
 		}

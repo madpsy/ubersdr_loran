@@ -105,25 +105,32 @@ type TDOAEngine struct {
 
 	mu          sync.RWMutex
 	results     []TDOAMeasurement // latest results, one per secondary station across all chains
-	trackDeltas []int             // per-channel: last auto-track delta applied (bins); 0 = locked
+	trackDeltas []*int            // per-channel: nil=not yet tracked, 0=aligned, non-zero=just adjusted
+	tracked     []bool            // per-channel: true once the one-shot alignment has fired
 }
 
 // NewTDOAEngine creates a TDOAEngine attached to the given decoder.
 func NewTDOAEngine(dec *LoranDecoder) *TDOAEngine {
 	return &TDOAEngine{
 		dec:         dec,
-		trackDeltas: make([]int, nch),
+		trackDeltas: make([]*int, nch),
+		tracked:     make([]bool, nch),
 	}
 }
 
 // TrackDeltas returns a snapshot of the last auto-track delta for each channel.
-// A value of 0 means the master peak was already within the hysteresis band
-// (locked); a non-zero value is the number of bins the window was shifted.
-func (e *TDOAEngine) TrackDeltas() []int {
+// nil = not yet tracked (master not yet heard), *0 = aligned, *N = just adjusted by N bins.
+// Serialises to JSON as null / 0 / N respectively.
+func (e *TDOAEngine) TrackDeltas() []*int {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	out := make([]int, len(e.trackDeltas))
-	copy(out, e.trackDeltas)
+	out := make([]*int, len(e.trackDeltas))
+	for i, p := range e.trackDeltas {
+		if p != nil {
+			v := *p
+			out[i] = &v
+		}
+	}
 	return out
 }
 
@@ -196,25 +203,45 @@ func (e *TDOAEngine) Update() {
 		masterBin, masterSub, masterSNR := findPeak(avg, 0, len(avg))
 		masterValid := masterSNR >= minSNRdB
 
-		// Auto-track: if the master is clearly heard, shift the GRI window so
-		// the master peak lands at autoTrackTargetFrac of the buffer.  This
-		// keeps the master visible near the left of the scope and leaves room
-		// for all secondaries (which arrive later) to the right.
-		// Only adjust when the peak is far enough from the target (hysteresis)
-		// to avoid jitter on a peak that is already well-positioned.
-		// Record the delta (0 = locked, non-zero = adjusting) for status display.
-		trackDelta := 0
-		if masterValid {
+		// Auto-track: one-shot alignment.  The first time the master is clearly
+		// heard and its peak is far from the target position, shift the GRI
+		// window so the master lands at autoTrackTargetFrac of the buffer.
+		// This is done only ONCE per channel (tracked[chIdx] = true after the
+		// first alignment) because SetOffset resets the averaging buffer
+		// (restart=true), and repeated resets would prevent the averager from
+		// building up — causing artificially high SNR on every channel.
+		// After the one-shot alignment the peak stays near the target because
+		// the GRI period is stable; no further adjustment is needed.
+		// trackDeltaPtr: nil = not yet tracked, &0 = aligned, &N = just adjusted.
+		// Serialises to JSON as null / 0 / N.
+		var trackDeltaPtr *int
+		e.mu.Lock()
+		alreadyTracked := chIdx < len(e.tracked) && e.tracked[chIdx]
+		e.mu.Unlock()
+		if masterValid && !alreadyTracked {
 			targetBin := int(float64(len(avg)) * autoTrackTargetFrac)
 			delta := masterBin - targetBin
 			if delta < -autoTrackHysteresisBins || delta > autoTrackHysteresisBins {
 				e.dec.SetOffset(chIdx, delta)
-				trackDelta = delta
+				trackDeltaPtr = &delta
+			} else {
+				zero := 0
+				trackDeltaPtr = &zero
 			}
+			// Mark as tracked regardless — even if already within hysteresis,
+			// we don't want to check again every cycle.
+			e.mu.Lock()
+			if chIdx < len(e.tracked) {
+				e.tracked[chIdx] = true
+			}
+			e.mu.Unlock()
+		} else if alreadyTracked {
+			zero := 0
+			trackDeltaPtr = &zero
 		}
 		e.mu.Lock()
 		if chIdx < len(e.trackDeltas) {
-			e.trackDeltas[chIdx] = trackDelta
+			e.trackDeltas[chIdx] = trackDeltaPtr
 		}
 		e.mu.Unlock()
 
