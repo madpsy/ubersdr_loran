@@ -510,20 +510,10 @@ func (c *client) runOnce() (reconnect bool) {
 			}
 
 			// Feed samples to the Loran-C decoder; broadcast any scope frames.
+			// TDOA/LOP updates are driven by the push loop in server.go (every 5 s),
+			// not here — calling them per-channel-frame (140×/s) was the CPU hot path.
 			loranDec.ProcessSamples(samples, func(chIdx int, cmd byte, payload []byte) {
 				c.server.BroadcastScope(chIdx, cmd, payload)
-				// After each scope frame, update TDOA and LOP measurements.
-				if tdoaEng != nil {
-					tdoaEng.Update()
-					// LOPEngine reads from TDOAEngine — update after TDOA.
-					s := c.server
-					s.lopMu.RLock()
-					lop := s.lopEng
-					s.lopMu.RUnlock()
-					if lop != nil {
-						lop.Update()
-					}
-				}
 			})
 
 		case websocket.TextMessage:

@@ -8,6 +8,7 @@ package main
 
 import (
 	"math"
+	"sort"
 	"sync"
 )
 
@@ -311,19 +312,9 @@ func (d *LoranDecoder) Quality(ch int) ChannelQuality {
 	}
 
 	// Noise floor: mean of the lower 50% of bucket values (sorted ascending).
-	// Simple selection: copy, sort, average bottom half.
 	sorted := make([]float32, n)
 	copy(sorted, vals)
-	// Insertion sort — n ≤ 1199, fast enough.
-	for i := 1; i < n; i++ {
-		key := sorted[i]
-		j := i - 1
-		for j >= 0 && sorted[j] > key {
-			sorted[j+1] = sorted[j]
-			j--
-		}
-		sorted[j+1] = key
-	}
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
 	half := n / 2
 	if half < 1 {
 		half = 1

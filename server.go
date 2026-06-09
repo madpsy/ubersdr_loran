@@ -264,11 +264,13 @@ func (s *ScopeServer) buildPushFrames() [][]byte {
 		}
 	}
 
-	// tdoa_update
+	// tdoa_update — drive the TDOA engine here (push loop runs every 5 s),
+	// not in the per-channel scope callback (which fired 140×/s).
 	s.tdoaMu.RLock()
 	tdoaEng := s.tdoaEng
 	s.tdoaMu.RUnlock()
 	if tdoaEng != nil {
+		tdoaEng.Update()
 		results := tdoaEng.Results()
 		if b, err := json.Marshal(map[string]interface{}{
 			"type":         "tdoa_update",
@@ -278,11 +280,12 @@ func (s *ScopeServer) buildPushFrames() [][]byte {
 		}
 	}
 
-	// lop_update + fix_update
+	// lop_update + fix_update — drive the LOP engine here too.
 	s.lopMu.RLock()
 	lopEng := s.lopEng
 	s.lopMu.RUnlock()
 	if lopEng != nil {
+		lopEng.Update()
 		lops := lopEng.LOPs()
 		if b, err := json.Marshal(map[string]interface{}{
 			"type": "lop_update",
