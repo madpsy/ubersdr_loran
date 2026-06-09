@@ -32,7 +32,7 @@ import (
 //   Frame header (3 bytes):  "DAT"
 //   Followed by:
 //     [0]  uint8   cmd  (0=SCOPE_DATA, 1=SCOPE_RESET)
-//     [1]  uint8   ch   (0 or 1)
+//     [1]  uint8   ch   (0 … nch-1)
 //     [2…] uint8   scope bytes (nbucket values, 0-255)
 //
 // This mirrors ext_send_msg_data() in the KiwiSDR C++ source.
@@ -252,6 +252,8 @@ func (s *ScopeServer) handleWS(w http.ResponseWriter, r *http.Request) {
 //	{ "type": "set_avg_algo",  "ch": 0, "algo": 1 }
 //	{ "type": "set_avg_param", "ch": 0, "param": 256.0 }
 //	{ "type": "start" }
+//
+// ch may be 0 … nch-1.
 func (s *ScopeServer) handleControl(msg []byte) {
 	var m map[string]interface{}
 	if err := json.Unmarshal(msg, &m); err != nil {

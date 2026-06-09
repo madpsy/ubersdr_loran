@@ -5,223 +5,147 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Loran-C Viewer</title>
 <style>
+  :root {
+    --bg:        #0d0d0f;
+    --surface:   #16161a;
+    --border:    #2a2a30;
+    --text:      #e2e2e8;
+    --muted:     #6b6b7a;
+    --accent:    #00d4ff;
+    --ok:        #22c55e;
+    --err:       #ef4444;
+    --radius:    10px;
+    --font:      "Inter", system-ui, -apple-system, sans-serif;
+  }
+
   * { box-sizing: border-box; margin: 0; padding: 0; }
 
   body {
-    background: #1a1a1a;
-    color: #e0e0e0;
-    font-family: Verdana, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
     font-size: 13px;
-    padding: 8px;
+    min-height: 100vh;
+    padding: 16px;
   }
 
-  h1 {
-    color: #00ffff;
-    font-size: 16px;
-    margin-bottom: 4px;
-  }
-
-  .subtitle {
-    color: #aaa;
-    font-size: 12px;
-    margin-bottom: 10px;
-  }
-
-  .subtitle a { color: #7af; }
-
-  #status {
-    display: inline-block;
-    padding: 2px 8px;
-    border-radius: 3px;
-    font-size: 11px;
-    margin-bottom: 8px;
-  }
-  .status-ok  { background: #1a4a1a; color: #4f4; }
-  .status-err { background: #4a1a1a; color: #f44; }
-
-  /* Scope canvas container */
-  #scope-container {
-    background: black;
-    width: 100%;
-    height: 200px;
-    position: relative;
-    margin-bottom: 10px;
-    cursor: crosshair;
-  }
-
-  #scope {
-    position: absolute;
-    top: 0; left: 0;
-    width: 100%;
-    height: 200px;
-  }
-
-  /* Controls: two columns side by side */
-  .controls-row {
+  /* ── Header ─────────────────────────────────────────────── */
+  header {
     display: flex;
-    gap: 16px;
-    flex-wrap: wrap;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 14px;
   }
 
-  .channel-controls {
-    flex: 1;
-    min-width: 240px;
-    background: #222;
-    border: 1px solid #444;
-    border-radius: 4px;
-    padding: 8px 10px;
+  .logo {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    background: linear-gradient(135deg, #00d4ff22, #7c3aed22);
+    border: 1px solid #00d4ff33;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    flex-shrink: 0;
   }
 
-  .channel-controls h2 {
-    font-size: 13px;
-    color: #ff6060;
-    margin-bottom: 6px;
+  .header-text h1 {
+    font-size: 15px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    color: var(--text);
   }
 
-  .ctrl-row {
+  .header-text p {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 1px;
+  }
+
+  /* ── Status pill ─────────────────────────────────────────── */
+  #status {
+    margin-left: auto;
     display: flex;
     align-items: center;
     gap: 6px;
-    margin-bottom: 5px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    font-size: 11px;
+    font-weight: 500;
+    border: 1px solid transparent;
+    transition: background 0.3s, color 0.3s, border-color 0.3s;
   }
 
-  .ctrl-row label {
-    width: 90px;
+  #status::before {
+    content: '';
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
     flex-shrink: 0;
-    color: #aaa;
-    font-size: 11px;
   }
 
-  .ctrl-row input[type=number] {
-    width: 70px;
-    background: #333;
-    border: 1px solid #555;
-    color: #fff;
-    padding: 2px 4px;
-    border-radius: 3px;
-    font-size: 12px;
+  .status-ok {
+    background: #16301e;
+    color: var(--ok);
+    border-color: #22c55e33;
+  }
+  .status-ok::before  { background: var(--ok); box-shadow: 0 0 6px var(--ok); }
+
+  .status-err {
+    background: #2d1515;
+    color: var(--err);
+    border-color: #ef444433;
+  }
+  .status-err::before { background: var(--err); }
+
+  /* ── Scope card ──────────────────────────────────────────── */
+  #scope-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    overflow: hidden;
   }
 
-  .ctrl-row select {
-    flex: 1;
-    background: #333;
-    border: 1px solid #555;
-    color: #fff;
-    padding: 2px 4px;
-    border-radius: 3px;
-    font-size: 11px;
+  #scope-container {
+    width: 100%;
+    cursor: crosshair;
+    background: #000;
   }
 
-  .ctrl-row input[type=range] {
-    flex: 1;
+  #scope {
+    display: block;
+    width: 100%;
   }
 
-  .ctrl-row span {
-    font-size: 11px;
-    color: #ccc;
-    min-width: 100px;
-  }
-
+  /* ── Footer hint ─────────────────────────────────────────── */
   .hint {
-    margin-top: 8px;
-    color: #666;
+    margin-top: 10px;
+    color: var(--muted);
     font-size: 11px;
+    text-align: center;
+    letter-spacing: 0.01em;
   }
 </style>
 </head>
 <body>
 
-<h1>Loran-C Viewer</h1>
-<p class="subtitle">
-  100 kHz pulse-envelope scope &nbsp;|&nbsp;
-  See also <a href="http://df6nm.bplaced.net/LoranView/LoranGrabber.htm" target="_blank">LoranView</a> by DF6NM
-</p>
+<header>
+  <div class="logo">📡</div>
+  <div class="header-text">
+    <h1>Loran-C Viewer</h1>
+    <p>100 kHz pulse-envelope scope — 14 chains simultaneously</p>
+  </div>
+  <span id="status" class="status-err">Connecting…</span>
+</header>
 
-<span id="status" class="status-err">Connecting…</span>
-
-<!-- Scope canvas -->
-<div id="scope-container">
-  <canvas id="scope" height="200"></canvas>
+<div id="scope-card">
+  <div id="scope-container">
+    <canvas id="scope"></canvas>
+  </div>
 </div>
 
-<!-- Per-channel controls -->
-<div class="controls-row">
-
-  <!-- Channel 0 -->
-  <div class="channel-controls">
-    <h2>Channel 0 (cyan)</h2>
-
-    <div class="ctrl-row">
-      <label>GRI</label>
-      <input type="number" id="gri-input-0" min="1" max="9999" step="1"
-             onchange="onGRIInput(0)" onkeydown="if(event.key==='Enter')onGRIInput(0)">
-    </div>
-    <div class="ctrl-row">
-      <label>Chain</label>
-      <select id="gri-select-0" onchange="onGRISelect(0)">
-        <option value="-1">— select —</option>
-      </select>
-    </div>
-    <div class="ctrl-row">
-      <label id="gain-label-0">Gain (auto-scale)</label>
-      <input type="range" id="gain-0" min="0" max="100" value="0"
-             oninput="onGainChange(0)">
-    </div>
-    <div class="ctrl-row">
-      <label>Averaging</label>
-      <select id="avg-algo-0" onchange="onAvgAlgoChange(0)">
-        <option value="0">CMA</option>
-        <option value="1" selected>EMA</option>
-        <option value="2">IIR</option>
-      </select>
-    </div>
-    <div class="ctrl-row">
-      <span id="avg-param-label-0">Decay 256</span>
-      <input type="range" id="avg-param-0" min="0" max="100" value="50"
-             oninput="onAvgParamChange(0)">
-    </div>
-  </div>
-
-  <!-- Channel 1 -->
-  <div class="channel-controls">
-    <h2>Channel 1 (violet)</h2>
-
-    <div class="ctrl-row">
-      <label>GRI</label>
-      <input type="number" id="gri-input-1" min="1" max="9999" step="1"
-             onchange="onGRIInput(1)" onkeydown="if(event.key==='Enter')onGRIInput(1)">
-    </div>
-    <div class="ctrl-row">
-      <label>Chain</label>
-      <select id="gri-select-1" onchange="onGRISelect(1)">
-        <option value="-1">— select —</option>
-      </select>
-    </div>
-    <div class="ctrl-row">
-      <label id="gain-label-1">Gain (auto-scale)</label>
-      <input type="range" id="gain-1" min="0" max="100" value="0"
-             oninput="onGainChange(1)">
-    </div>
-    <div class="ctrl-row">
-      <label>Averaging</label>
-      <select id="avg-algo-1" onchange="onAvgAlgoChange(1)">
-        <option value="0">CMA</option>
-        <option value="1" selected>EMA</option>
-        <option value="2">IIR</option>
-      </select>
-    </div>
-    <div class="ctrl-row">
-      <span id="avg-param-label-1">Decay 256</span>
-      <input type="range" id="avg-param-1" min="0" max="100" value="50"
-             oninput="onAvgParamChange(1)">
-    </div>
-  </div>
-
-</div>
-
-<p class="hint">
-  Click on the scope to shift-align the master station pulse to that position.
-</p>
+<p class="hint">Click a row to shift-align that chain's master station pulse</p>
 
 <script>window.BASE_PATH = "{{.BasePath}}";</script>
 <script src="{{.BasePath}}/loran_c.js"></script>

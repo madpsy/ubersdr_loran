@@ -1,25 +1,14 @@
 // loran_c.js — Loran-C scope renderer for ubersdr_loran
 //
-// Ported from KiwiSDR web/extensions/Loran_C/Loran_C.js
-// Original copyright (c) 2016-2023 John Seamons, ZL4VO/KF6VO
-// Port copyright (c) 2026 UberSDR project
-//
-// Communicates with server.go via a plain WebSocket (no KiwiSDR ext_* APIs).
-// Binary frames:  "DAT" + cmd(1) + ch(1) + scope_bytes(nbucket)
-// Text frames:    JSON { type, ... }
-// Control frames: JSON sent to server
-//
-// Proxy-aware: uses window.BASE_PATH (injected by index.html template) to
-// prefix the WebSocket URL so it works behind /addon/loran/ as well as directly.
+// All GRI_LIST chains are decoded and displayed simultaneously — one row each.
+// There are no per-channel controls; every chain is always on.
 
 'use strict';
 
-// BASE_PATH is set by the index.html template from the X-Forwarded-Prefix header.
-// e.g. "/addon/loran" when behind the UberSDR proxy, "" when accessed directly.
 const BASE_PATH = (typeof window.BASE_PATH === 'string') ? window.BASE_PATH : '';
 
 // ---------------------------------------------------------------------------
-// GRI chain table (mirrors gri_s / gri_2s / emission_delay in Loran_C.js)
+// GRI chain table
 // ---------------------------------------------------------------------------
 
 const GRI_LIST = [
@@ -39,7 +28,8 @@ const GRI_LIST = [
     { gri: 9960, name: 'USA east coast (eLoran)', short: ['USA east coast', '(eLoran)'] },
 ];
 
-// Emission (tx) delay data from Markus Vester, DF6NM
+const NCH = GRI_LIST.length; // must match nch in decoder.go
+
 const EMISSION_DELAY = {
     5960: [{ s:'M Inta', d:0 }, { s:'X Tumanny Pen', d:14670.15 }, { s:'Z Norilsk', d:45915.33 }],
     5990: [{ s:'M Caucasian Center', d:0 }, { s:'X Caucasian West', d:16587 }, { s:'Y Caucasian East', d:31304 }, { s:'Z Caucasian North', d:46440 }],
@@ -59,14 +49,19 @@ const EMISSION_DELAY = {
 
 const STATION_COLORS = ['red', 'yellow', 'lime', 'blue', 'grey'];
 
+// One distinct trace colour per channel row
+const TRACE_COLORS = [
+    'cyan', 'violet', '#ff9900', '#00ff88', '#ff4488',
+    '#44aaff', '#ffff44', '#ff6644', '#88ff44', '#44ffee',
+    '#cc88ff', '#ff88cc', '#88ccff', '#ffcc44',
+];
+
 const CMD_SCOPE_DATA  = 0;
 const CMD_SCOPE_RESET = 1;
 
-const SCOPE_START_X = 125;  // pixels reserved for left legend
-const H_LEGEND      = 20;   // pixels for bottom legend bar
-
-// Default chains (indices into GRI_LIST)
-const DEFAULT_CHAIN = [7, 3]; // Western Russia, China BPL
+const SCOPE_START_X = 130;  // pixels reserved for left legend
+const H_LEGEND      = 20;   // pixels for emission-delay bar at bottom of each row
+const ROW_HEIGHT    = 90;   // total pixels per channel row
 
 // ---------------------------------------------------------------------------
 // State
@@ -75,331 +70,243 @@ const DEFAULT_CHAIN = [7, 3]; // Western Russia, China BPL
 let ws = null;
 let msPerBin = 0;
 let canvas, ctx;
-let scopeWidth = 0, scopeHeight = 0;
+let scopeWidth = 0;
 
-// Per-channel state
-const ch = [
-    { gri: 0, griSel: -1, gain: 0, avgAlgo: 1, avgParam: 50, nbuckets: 0 },
-    { gri: 0, griSel: -1, gain: 0, avgAlgo: 1, avgParam: 50, nbuckets: 0 },
-];
+// nbuckets per channel (updated when first data arrives)
+const nbuckets = new Array(NCH).fill(0);
 
 // ---------------------------------------------------------------------------
-// WebSocket connection
+// Layout helpers
+// ---------------------------------------------------------------------------
+
+function rowTop(i)    { return i * ROW_HEIGHT; }
+function rowBottom(i) { return (i + 1) * ROW_HEIGHT - H_LEGEND; } // top of legend bar
+function scopeH()     { return ROW_HEIGHT - H_LEGEND; }
+
+// ---------------------------------------------------------------------------
+// WebSocket
 // ---------------------------------------------------------------------------
 
 function connect() {
     const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const wsUrl = `${proto}://${location.host}${BASE_PATH}/ws`;
-    ws = new WebSocket(wsUrl);
+    ws = new WebSocket(`${proto}://${location.host}${BASE_PATH}/ws`);
     ws.binaryType = 'arraybuffer';
 
     ws.onopen = () => {
-        console.log('WS connected');
         document.getElementById('status').textContent = 'Connected';
         document.getElementById('status').className = 'status-ok';
-        // Send start and current GRI settings
         sendControl({ type: 'start' });
-        for (let i = 0; i < 2; i++) {
-            if (ch[i].gri > 0) applyGRI(i, ch[i].gri);
+        // Register every GRI with its channel index
+        for (let i = 0; i < NCH; i++) {
+            const gri = GRI_LIST[i].gri;
+            // 5991 shares the 5990 transmitter on the server side
+            sendControl({ type: 'set_gri', ch: i, gri: gri === 5991 ? 5990 : gri });
         }
     };
 
     ws.onclose = () => {
-        console.log('WS closed — reconnecting in 3s');
         document.getElementById('status').textContent = 'Disconnected — reconnecting…';
         document.getElementById('status').className = 'status-err';
         setTimeout(connect, 3000);
     };
 
-    ws.onerror = (e) => {
-        console.error('WS error', e);
-    };
+    ws.onerror = (e) => console.error('WS error', e);
 
     ws.onmessage = (evt) => {
-        if (evt.data instanceof ArrayBuffer) {
-            handleBinary(evt.data);
-        } else {
-            handleText(evt.data);
-        }
+        if (evt.data instanceof ArrayBuffer) handleBinary(evt.data);
+        else handleText(evt.data);
     };
 }
 
 function sendControl(obj) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify(obj));
-    }
+    if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj));
 }
 
 // ---------------------------------------------------------------------------
-// Binary frame handler
-// Matches server.go BroadcastScope wire format:
-//   "DAT" (3 bytes) + cmd (1 byte) + payload (ch byte + nbucket bytes)
+// Binary frame: "DAT" + cmd(1) + ch(1) + scope_bytes
 // ---------------------------------------------------------------------------
 
 function handleBinary(buf) {
     const ba = new Uint8Array(buf);
-    // Check "DAT" header
     if (ba[0] !== 0x44 || ba[1] !== 0x41 || ba[2] !== 0x54) return;
-
-    const cmd     = ba[3];
-    const chIdx   = ba[4];
-    const data    = ba.slice(5);  // nbucket scope bytes
-
-    if (chIdx < 0 || chIdx >= 2) return;
-    ch[chIdx].nbuckets = data.length;
-
+    const cmd   = ba[3];
+    const chIdx = ba[4];
+    const data  = ba.slice(5);
+    if (chIdx < 0 || chIdx >= NCH) return;
+    nbuckets[chIdx] = data.length;
     drawScope(chIdx, cmd, data);
 }
 
 // ---------------------------------------------------------------------------
-// Text frame handler
+// Text frame
 // ---------------------------------------------------------------------------
 
 function handleText(raw) {
     let msg;
     try { msg = JSON.parse(raw); } catch(e) { return; }
-
     if (msg.type === 'ms_per_bin') {
         msPerBin = parseFloat(msg.ms_per_bin);
-        console.log('ms_per_bin =', msPerBin);
-        // Redraw legends with updated scale
-        for (let i = 0; i < 2; i++) {
-            if (ch[i].gri > 0) drawLegend(i, ch[i].gri);
-        }
+        for (let i = 0; i < NCH; i++) drawLegend(i);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Canvas drawing — mirrors loran_c_recv() and loran_c_draw_legend() in Loran_C.js
+// Drawing
 // ---------------------------------------------------------------------------
 
 function drawScope(chIdx, cmd, data) {
     if (!canvas) return;
-    const w  = scopeWidth;
-    const h  = scopeHeight;
-    const sx = SCOPE_START_X;
-    const sy = (chIdx + 1) * h / 2 - H_LEGEND;
-    const yh = h / 2 - H_LEGEND;
+    const sx    = SCOPE_START_X;
+    const yb    = rowBottom(chIdx);
+    const yh    = scopeH();
+    const color = TRACE_COLORS[chIdx % TRACE_COLORS.length];
 
     if (cmd === CMD_SCOPE_RESET) {
-        ctx.fillStyle = 'black';
-        ctx.fillRect(sx, chIdx * h / 2, w - sx, yh);
-        drawLegend(chIdx, ch[chIdx].gri);
+        ctx.fillStyle = '#050507';
+        ctx.fillRect(sx, rowTop(chIdx), scopeWidth - sx, yh);
+        drawLegend(chIdx);
     }
 
-    const color = chIdx === 0 ? 'cyan' : 'violet';
     const blen = data.length;
-
     for (let i = 0; i < blen; i++) {
         const z = data[i] / 255;
-        ctx.fillStyle = 'black';
-        ctx.fillRect(sx + i, sy, 1, -yh);
-        ctx.fillStyle = color;
-        ctx.fillRect(sx + i, sy, 1, z * -yh);
+        // Background column
+        ctx.fillStyle = '#050507';
+        ctx.fillRect(sx + i, yb, 1, -yh);
+        if (z > 0) {
+            // Glow: faint wide bar behind the trace
+            ctx.fillStyle = color;
+            ctx.globalAlpha = 0.12;
+            ctx.fillRect(sx + i, yb, 1, z * -yh);
+            // Solid trace
+            ctx.globalAlpha = 0.9;
+            ctx.fillRect(sx + i, yb, 1, Math.max(z * -yh, -1));
+            ctx.globalAlpha = 1.0;
+        }
     }
     // Clear right of data
-    ctx.fillStyle = 'black';
-    ctx.fillRect(sx + blen, sy, w - sx - blen + 1, -yh);
+    ctx.fillStyle = '#050507';
+    ctx.fillRect(sx + blen, yb, scopeWidth - sx - blen + 1, -yh);
 }
 
-function drawLegend(chIdx, gri) {
-    if (!canvas || msPerBin === 0 || gri === 0) return;
+function drawLegend(chIdx) {
+    if (!canvas) return;
+    const gri   = GRI_LIST[chIdx].gri;
+    const entry = GRI_LIST[chIdx];
+    const color = TRACE_COLORS[chIdx % TRACE_COLORS.length];
+    const sx    = SCOPE_START_X;
+    const yb    = rowBottom(chIdx);   // top of legend bar
+    const yt    = rowTop(chIdx);
 
-    const w       = scopeWidth;
-    const h       = scopeHeight;
-    const sx      = SCOPE_START_X;
-    const sy      = (chIdx + 1) * h / 2;
-    const yh      = h / 2 - H_LEGEND;
-    const hbar    = 6;
-    const off     = 8;
+    // ── Left margin ──────────────────────────────────────────
+    // Subtle tinted background matching the trace colour
+    ctx.fillStyle = '#0d0d0f';
+    ctx.fillRect(0, yt, sx - 1, ROW_HEIGHT);
 
-    ctx.font = '12px Verdana';
+    // Thin left accent bar
+    ctx.fillStyle = color;
+    ctx.globalAlpha = 0.7;
+    ctx.fillRect(0, yt + 2, 3, ROW_HEIGHT - 4);
+    ctx.globalAlpha = 1.0;
 
-    // GRI label (top-left of channel area)
-    ctx.fillStyle = 'white';
-    ctx.fillText('GRI ' + gri, 0, sy - yh / 3 - H_LEGEND - off);
+    // GRI number — bold, trace colour
+    ctx.font = 'bold 11px "Inter", system-ui, sans-serif';
+    ctx.fillStyle = color;
+    ctx.fillText('GRI ' + gri, 7, yt + 14);
 
-    // Chain name
-    const entry = GRI_LIST.find(e => e.gri === gri);
-    if (entry) {
-        ctx.fillText(entry.short[0], 0, sy - yh / 3 - H_LEGEND + off);
-        ctx.fillText(entry.short[1], 0, sy - yh / 3 - H_LEGEND + 3 * off);
-    }
+    // Chain name lines — muted white
+    ctx.font = '10px "Inter", system-ui, sans-serif';
+    ctx.fillStyle = '#9090a0';
+    ctx.fillText(entry.short[0], 7, yt + 27);
+    if (entry.short[1]) ctx.fillText(entry.short[1], 7, yt + 39);
 
-    // Emission delay bars
+    // ── Emission-delay bar ───────────────────────────────────
+    ctx.fillStyle = '#0a0a0c';
+    ctx.fillRect(sx, yb, scopeWidth - sx, H_LEGEND);
+
+    if (msPerBin === 0) return;
     const ed = EMISSION_DELAY[gri];
     if (!ed) return;
 
     for (let i = 0; i < ed.length; i++) {
-        let ed0 = ed[i].d / 1000;
-        let ed1 = (i < ed.length - 1) ? ed[i + 1].d / 1000 : gri / 100;
+        let ed0 = Math.round((ed[i].d / 1000) / msPerBin);
+        let ed1 = Math.round(((i < ed.length - 1 ? ed[i + 1].d : gri * 10) / 1000) / msPerBin);
 
-        ed0 = Math.round(ed0 / msPerBin);
-        ed1 = Math.round(ed1 / msPerBin);
-
+        // Coloured segment
         ctx.fillStyle = STATION_COLORS[i % STATION_COLORS.length];
-        ctx.fillRect(sx + ed0, sy - H_LEGEND, ed1 - ed0, hbar);
-        ctx.fillStyle = 'white';
-        ctx.fillText(ed[i].s, sx + ed0, sy - 3);
+        ctx.globalAlpha = 0.85;
+        ctx.fillRect(sx + ed0, yb + 1, Math.max(ed1 - ed0 - 1, 1), 5);
+        ctx.globalAlpha = 1.0;
+
+        // Station label
+        ctx.font = '9px "Inter", system-ui, sans-serif';
+        ctx.fillStyle = '#c0c0cc';
+        ctx.fillText(ed[i].s, sx + ed0 + 2, yb + H_LEGEND - 4);
     }
 }
 
 // ---------------------------------------------------------------------------
-// GRI control helpers
+// Canvas click — align master station for the clicked row
 // ---------------------------------------------------------------------------
 
-function applyGRI(chIdx, gri) {
-    gri = parseInt(gri);
-    if (isNaN(gri) || gri <= 0) return;
-
-    // Hack: 5991 (US west coast eLoran test) uses 5990 on the server side
-    const serverGRI = (gri === 5991) ? 5990 : gri;
-
-    ch[chIdx].gri = gri;
-
-    // Clear channel area and redraw legend
-    if (canvas) {
-        const h = scopeHeight;
-        ctx.fillStyle = 'black';
-        ctx.fillRect(0, chIdx * h / 2, scopeWidth, h / 2);
-        ctx.font = '12px Verdana';
-        drawLegend(chIdx, gri);
-    }
-
-    sendControl({ type: 'set_gri', ch: chIdx, gri: serverGRI });
-}
-
-// ---------------------------------------------------------------------------
-// UI event handlers
-// ---------------------------------------------------------------------------
-
-function onGRIInput(chIdx) {
-    const input = document.getElementById('gri-input-' + chIdx);
-    const gri = parseInt(input.value);
-    if (!isNaN(gri) && gri > 0) {
-        // Sync dropdown
-        const sel = document.getElementById('gri-select-' + chIdx);
-        const idx = GRI_LIST.findIndex(e => e.gri === gri);
-        sel.value = idx >= 0 ? idx : -1;
-        applyGRI(chIdx, gri);
-    }
-}
-
-function onGRISelect(chIdx) {
-    const sel = document.getElementById('gri-select-' + chIdx);
-    const idx = parseInt(sel.value);
-    if (idx < 0 || idx >= GRI_LIST.length) return;
-    const gri = GRI_LIST[idx].gri;
-    document.getElementById('gri-input-' + chIdx).value = gri;
-    applyGRI(chIdx, gri);
-}
-
-function onGainChange(chIdx) {
-    const slider = document.getElementById('gain-' + chIdx);
-    const val = parseInt(slider.value);
-    ch[chIdx].gain = val;
-    const label = document.getElementById('gain-label-' + chIdx);
-    label.textContent = val === 0 ? 'Gain (auto-scale)' : 'Gain ' + val + ' dB';
-    sendControl({ type: 'set_gain', ch: chIdx, gain: val });
-}
-
-function onAvgAlgoChange(chIdx) {
-    const sel = document.getElementById('avg-algo-' + chIdx);
-    const algo = parseInt(sel.value);
-    ch[chIdx].avgAlgo = algo;
-    sendControl({ type: 'set_avg_algo', ch: chIdx, algo: algo });
-    // Re-send current param for this algo
-    onAvgParamChange(chIdx);
-}
-
-function onAvgParamChange(chIdx) {
-    const slider = document.getElementById('avg-param-' + chIdx);
-    const sliderVal = parseInt(slider.value);
-    ch[chIdx].avgParam = sliderVal;
-
-    // Convert slider 0-100 to actual param value (mirrors loran_c_param_val in Loran_C.js)
-    const algo = ch[chIdx].avgAlgo;
-    const maxVals = [32, 512, 1.0];
-    const minVals = [1, 1, 0];
-    let param = sliderVal * maxVals[algo] / 100;
-    if (maxVals[algo] > 1) param = Math.ceil(param);
-    if (param < minVals[algo]) param = minVals[algo];
-
-    const paramNames = ['Averages', 'Decay', 'Exp'];
-    document.getElementById('avg-param-label-' + chIdx).textContent =
-        paramNames[algo] + ' ' + param;
-
-    sendControl({ type: 'set_avg_param', ch: chIdx, param: param });
-}
-
-// Canvas click — shift-click to align master station (mirrors loran_c_mousedown)
 function onCanvasClick(evt) {
     if (!canvas) return;
-    const rect = canvas.getBoundingClientRect();
-    const x = evt.clientX - rect.left;
-    const y = evt.clientY - rect.top;
-    const chIdx = (y < scopeHeight / 2) ? 0 : 1;
+    const rect   = canvas.getBoundingClientRect();
+    const scaleY = canvas.height / rect.height;
+    const scaleX = canvas.width  / rect.width;
+    const y      = (evt.clientY - rect.top)  * scaleY;
+    const x      = (evt.clientX - rect.left) * scaleX;
+    const chIdx  = Math.floor(y / ROW_HEIGHT);
+    if (chIdx < 0 || chIdx >= NCH) return;
     const offset = Math.round(x) - SCOPE_START_X;
-    if (offset < 0 || offset >= ch[chIdx].nbuckets) return;
+    if (offset < 0 || offset >= nbuckets[chIdx]) return;
     sendControl({ type: 'set_offset', ch: chIdx, offset: offset });
 }
 
 // ---------------------------------------------------------------------------
-// Resize handling
+// Resize
 // ---------------------------------------------------------------------------
 
 function resizeCanvas() {
     if (!canvas) return;
-    const container = document.getElementById('scope-container');
-    const w = container.clientWidth;
-    scopeWidth  = w;
-    scopeHeight = canvas.height; // fixed at 200px
-    canvas.width = w;
+    const w = document.getElementById('scope-container').clientWidth;
+    scopeWidth    = w;
+    canvas.width  = w;
+    canvas.height = NCH * ROW_HEIGHT;
 
-    // Redraw legends after resize
-    for (let i = 0; i < 2; i++) {
-        if (ch[i].gri > 0) {
-            ctx.fillStyle = 'black';
-            ctx.fillRect(0, i * scopeHeight / 2, scopeWidth, scopeHeight / 2);
-            ctx.font = '12px Verdana';
-            drawLegend(i, ch[i].gri);
+    // Base fill
+    ctx.fillStyle = '#050507';
+    ctx.fillRect(0, 0, w, canvas.height);
+
+    for (let i = 0; i < NCH; i++) {
+        // Subtle alternating row tint
+        if (i % 2 === 1) {
+            ctx.fillStyle = 'rgba(255,255,255,0.015)';
+            ctx.fillRect(0, rowTop(i), w, ROW_HEIGHT);
         }
+        // Row separator
+        if (i > 0) {
+            ctx.strokeStyle = '#1e1e24';
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(0, rowTop(i) - 0.5);
+            ctx.lineTo(w, rowTop(i) - 0.5);
+            ctx.stroke();
+        }
+        drawLegend(i);
     }
 }
 
 // ---------------------------------------------------------------------------
-// Initialisation
+// Init
 // ---------------------------------------------------------------------------
 
 function init() {
     canvas = document.getElementById('scope');
     ctx    = canvas.getContext('2d');
-
-    // Populate GRI dropdowns
-    for (let chIdx = 0; chIdx < 2; chIdx++) {
-        const sel = document.getElementById('gri-select-' + chIdx);
-        GRI_LIST.forEach((entry, idx) => {
-            const opt = document.createElement('option');
-            opt.value = idx;
-            opt.textContent = entry.gri + ' ' + entry.name;
-            sel.appendChild(opt);
-        });
-
-        // Set defaults
-        const defaultIdx = DEFAULT_CHAIN[chIdx];
-        sel.value = defaultIdx;
-        const defaultGRI = GRI_LIST[defaultIdx].gri;
-        document.getElementById('gri-input-' + chIdx).value = defaultGRI;
-        ch[chIdx].gri = defaultGRI;
-
-        // Initialise param labels
-        onAvgParamChange(chIdx);
-    }
-
     resizeCanvas();
     window.addEventListener('resize', resizeCanvas);
     canvas.addEventListener('click', onCanvasClick);
-
     connect();
 }
 

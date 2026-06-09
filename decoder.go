@@ -38,8 +38,9 @@ const (
 	avgEMA = 1
 	avgIIR = 2
 
-	// nch mirrors NCH — two simultaneous GRI channels.
-	nch = 2
+	// nch is the number of simultaneous GRI channels supported.
+	// One per entry in the GRI_LIST table in loran_c.js (14 chains).
+	nch = 14
 )
 
 // ---------------------------------------------------------------------------
@@ -92,7 +93,7 @@ type LoranDecoder struct {
 	scopeThreshold uint32
 
 	// loran_c_ch_t ch[NCH]
-	ch [nch]loranChannel
+	ch []loranChannel
 
 	// u1_t scope[MAX_BUCKET]
 	scope [maxBucket]byte
@@ -124,6 +125,7 @@ func NewLoranDecoder(srate float64, updateHz int) *LoranDecoder {
 		srate:          srate,
 		iSrate:         iSrate,
 		scopeThreshold: threshold,
+		ch:             make([]loranChannel, nch),
 	}
 	// Default averaging parameters (EMA, decay=256) — matches JS defaults.
 	for i := 0; i < nch; i++ {
@@ -202,13 +204,14 @@ func (d *LoranDecoder) SetAvgParam(ch int, param float64) {
 	c.restart = true
 }
 
-// Start mirrors: SET start — redraw_legend=true, both channels restart=true.
+// Start mirrors: SET start — redraw_legend=true, all channels restart=true.
 func (d *LoranDecoder) Start() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.redrawLegend = true
-	d.ch[0].restart = true
-	d.ch[1].restart = true
+	for i := range d.ch {
+		d.ch[i].restart = true
+	}
 }
 
 // ---------------------------------------------------------------------------
