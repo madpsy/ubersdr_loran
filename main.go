@@ -558,9 +558,16 @@ func (c *client) run() int {
 		}
 
 		retries++
-		backoff := time.Duration(1<<uint(retries)) * time.Second
+		shift := retries
+		if shift > 6 { // cap at 2^6=64s to avoid int64 overflow on 1<<uint(shift)
+			shift = 6
+		}
+		backoff := time.Duration(1<<uint(shift)) * time.Second
 		if backoff > maxBackoff {
 			backoff = maxBackoff
+		}
+		if backoff < 5*time.Second { // safety net: never reconnect faster than 5s
+			backoff = 5 * time.Second
 		}
 		fmt.Fprintf(os.Stderr, "reconnecting in %.0fs (attempt %d)…\n", backoff.Seconds(), retries)
 
