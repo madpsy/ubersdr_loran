@@ -24,14 +24,13 @@
 //	"iq384" → ±192 kHz → 384,000 Hz sample rate → ~2.6 µs/bin
 //
 // The actual sample rate is read from the PCM packet header on the first
-// full packet — no hardcoded assumptions are made.
+// packet — no hardcoded assumptions are made.
 
 package main
 
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -46,7 +45,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/klauspost/compress/zstd"
+	"github.com/madpsy/ubersdr_loran/internal/pcmv4"
 )
 
 // loranFrequencyHz is the Loran-C carrier frequency.
@@ -154,144 +153,73 @@ func fetchDescription(httpBase string) (*receiverDescription, error) {
 }
 
 // ---------------------------------------------------------------------------
-// PCM binary packet decoder (mirrors ubersdr_hfdl/main.go)
+// PCM binary packet decoder (audio protocol version 4)
 // ---------------------------------------------------------------------------
 //
-// The server sends packets in the UberSDR hybrid binary format.
-// Two packet types:
+// This tool asks the UberSDR server for protocol version 4, which replaced the
+// zstd-wrapped versions 1-3 shape this file used to parse. Two things changed
+// on the wire and neither is visible past this file:
 //
-//   Full header  (magic 0x5043 "PC", 29 bytes):
-//     [0:2]  uint16  magic
-//     [2]    uint8   version
-//     [3]    uint8   format (0=PCM, 2=PCM-zstd)
-//     [4:12] uint64  RTP timestamp (LE)
-//     [12:20]uint64  wall-clock ms (LE)
-//     [20:24]uint32  sample rate (LE)
-//     [24]   uint8   channels
-//     [25:29]uint32  reserved
-//     [29:]  []byte  PCM samples (big-endian int16)
+//   - the payload is no longer zstd around big-endian int16 samples but a
+//     predictive lossless code (internal/pcmv4/pcm_predictive.go) that emits
+//     int16 directly, so the per-packet byte swap is gone;
+//   - the fixed 29- or 37-byte header became a variable one carrying only what
+//     changed since the last packet, so there is no "full" and "minimal" packet
+//     distinction and no RTP anchor to extrapolate the clock from. Sample rate,
+//     channel count and timestamp are carried forward by the header decoder and
+//     are populated on every packet, so the sample rate the Loran decoder is
+//     built from and the ±5 kHz interleaved I/Q ordering it consumes are as
+//     they were.
 //
-//   Version 2 full header (37 bytes) adds signal quality fields:
-//     [25:29]float32 baseband power dBFS
-//     [29:33]float32 noise density dBFS
-//     [33:37]uint32  reserved
-//     [37:]  []byte  PCM samples (big-endian int16)
+// zstd never compressed this material -- it is an LZ77 matcher over bytes, and
+// a band-limited RF signal has no repeated byte strings, so every IQ mode
+// measured at 0.99x: the wrapped stream was larger than the samples it carried.
 //
-//   Minimal header (magic 0x504D "PM", 13 bytes):
-//     [0:2]  uint16  magic
-//     [2]    uint8   version
-//     [3:11] uint64  RTP timestamp (LE)
-//     [11:13]uint16  reserved
-//     [13:]  []byte  PCM samples (big-endian int16)
-
-const (
-	magicFull    = 0x5043 // "PC"
-	magicMinimal = 0x504D // "PM"
-)
+// The decoder is stateful and backward adaptive: it derives its predictor from
+// the samples already decoded and never receives a coefficient, so it belongs
+// to exactly one WebSocket connection. runOnce() builds a fresh one per
+// connection and drops it when the socket closes; carrying one across a
+// reconnect would decode the new stream against the old stream's adaptation and
+// produce plausible noise rather than an error.
 
 type pcmDecoder struct {
-	zd           *zstd.Decoder
-	lastRate     int
-	lastChannels int
-	lastWallMs   uint64 // wall-clock ms from the most recent full header
-	// RTP anchor: used to advance the wall clock on minimal-header packets.
-	// The RTP timestamp is a GPS-disciplined sample counter; we compute
-	//   currentWallMs = anchorWallMs + (rtpNow - anchorRTP) * 1000 / sampleRate
-	anchorRTP    uint64 // RTP sample count at the last full header
-	anchorWallMs uint64 // wall-clock ms at the last full header
+	v4 *pcmv4.PCMv4StreamDecoder
 }
 
-func newPCMDecoder() (*pcmDecoder, error) {
-	zd, err := zstd.NewReader(nil)
+// newPCMDecoder returns a decoder for one connection. It holds no state until
+// the first packet carrying metadata arrives, which the server sends at the
+// head of every stream and every five seconds after.
+func newPCMDecoder() *pcmDecoder {
+	return &pcmDecoder{v4: pcmv4.NewPCMv4StreamDecoder()}
+}
+
+// decode parses one binary WebSocket message.
+//
+// Returns the samples -- interleaved I/Q when the header reports two channels,
+// which is every mode this tool uses -- the sample rate, the channel count, and
+// the packet's wall-clock timestamp in milliseconds.
+//
+// The timestamp is the same quantity versions 1-3 carried in bytes [12:20] of
+// their full header: the server writes GPS-synchronised nanoseconds and those
+// headers carried it divided by a million, so timing.go's reading of it is
+// unchanged. It is zero when radiod reported no time.
+func (d *pcmDecoder) decode(data []byte) ([]int16, int, int, uint64, error) {
+	// A server older than 0.1.63 clamps a version request to 1-3 and answers
+	// with version 1 without saying so. Naming that is what turns a dead stream
+	// into a message the operator can act on.
+	if pcmv4.IsZstdFrame(data) {
+		return nil, 0, 0, 0, fmt.Errorf("server sent a zstd (protocol version 1) frame; it is too old for audio protocol version %d", pcmv4.ProtocolVersion)
+	}
+	if !pcmv4.PCMv4IsHeader(data) {
+		return nil, 0, 0, 0, fmt.Errorf("not a version %d packet (%d bytes)", pcmv4.ProtocolVersion, len(data))
+	}
+
+	h, samples, err := d.v4.DecodePacket(data)
 	if err != nil {
-		return nil, fmt.Errorf("zstd init: %w", err)
+		return nil, 0, 0, 0, err
 	}
-	return &pcmDecoder{zd: zd}, nil
+	return samples, h.SampleRate, h.Channels, h.TimestampNanos / 1e6, nil
 }
-
-// decode decompresses (if needed) and parses a binary PCM packet.
-// Returns big-endian int16 samples converted to little-endian, sample rate,
-// channel count, and wall-clock timestamp in milliseconds (0 for minimal headers).
-func (d *pcmDecoder) decode(data []byte, isZstd bool) ([]byte, int, int, uint64, error) {
-	if isZstd {
-		var err error
-		data, err = d.zd.DecodeAll(data, nil)
-		if err != nil {
-			return nil, 0, 0, 0, fmt.Errorf("zstd decompress: %w", err)
-		}
-	}
-
-	if len(data) < 4 {
-		return nil, 0, 0, 0, fmt.Errorf("packet too short (%d bytes)", len(data))
-	}
-
-	magic := binary.LittleEndian.Uint16(data[0:2])
-
-	var rate, ch int
-	var wallMs uint64
-	var raw []byte
-
-	switch magic {
-	case magicFull:
-		version := data[2]
-		var headerLen int
-		switch version {
-		case 2:
-			headerLen = 37
-		default: // version 1
-			headerLen = 29
-		}
-		if len(data) < headerLen {
-			return nil, 0, 0, 0, fmt.Errorf("full-header packet too short (%d < %d)", len(data), headerLen)
-		}
-		rtpFull := binary.LittleEndian.Uint64(data[4:12])
-		wallMs = binary.LittleEndian.Uint64(data[12:20])
-		rate = int(binary.LittleEndian.Uint32(data[20:24]))
-		ch = int(data[24])
-		raw = data[headerLen:]
-		d.lastRate = rate
-		d.lastChannels = ch
-		d.lastWallMs = wallMs
-		// Anchor the RTP counter so minimal-header packets can advance the clock.
-		d.anchorRTP = rtpFull
-		d.anchorWallMs = wallMs
-
-	case magicMinimal:
-		if len(data) < 13 {
-			return nil, 0, 0, 0, fmt.Errorf("minimal-header packet too short (%d bytes)", len(data))
-		}
-		raw = data[13:]
-		rate = d.lastRate
-		ch = d.lastChannels
-		if rate == 0 || ch == 0 {
-			return nil, 0, 0, 0, fmt.Errorf("minimal header received before full header")
-		}
-		// Advance wall clock using the RTP sample counter.
-		// rtpNow is the GPS-disciplined sample count; elapsed = (rtpNow - anchorRTP) samples.
-		rtpNow := binary.LittleEndian.Uint64(data[3:11])
-		if d.anchorWallMs > 0 && rtpNow >= d.anchorRTP {
-			elapsed := rtpNow - d.anchorRTP
-			wallMs = d.anchorWallMs + elapsed*1000/uint64(rate)
-		} else {
-			wallMs = d.lastWallMs
-		}
-		d.lastWallMs = wallMs
-
-	default:
-		return nil, 0, 0, 0, fmt.Errorf("unknown magic 0x%04X", magic)
-	}
-
-	// Convert big-endian int16 → little-endian int16
-	n := len(raw) / 2
-	le := make([]byte, len(raw))
-	for i := 0; i < n; i++ {
-		s := binary.BigEndian.Uint16(raw[i*2:])
-		binary.LittleEndian.PutUint16(le[i*2:], s)
-	}
-	return le, rate, ch, wallMs, nil
-}
-
-func (d *pcmDecoder) close() { d.zd.Close() }
 
 // ---------------------------------------------------------------------------
 // Client
@@ -338,6 +266,11 @@ func (c *client) wsURL() string {
 	q.Set("frequency", fmt.Sprintf("%d", loranFrequencyHz))
 	q.Set("mode", c.iqMode)
 	q.Set("format", "pcm-zstd")
+	// Audio protocol version 4: predictive lossless payload and a
+	// variable-length header, decoded above. The format name is unchanged --
+	// only the version moved. Sending no version at all, as this tool used to,
+	// gets version 1: the server's floor, not its current format.
+	q.Set("version", fmt.Sprintf("%d", pcmv4.ProtocolVersion))
 	q.Set("user_session_id", c.sessionID)
 	if c.password != "" {
 		q.Set("password", c.password)
@@ -420,12 +353,9 @@ func (c *client) runOnce() (reconnect bool) {
 	fmt.Fprintf(os.Stderr, "connected — freq=%d Hz, mode=%s (sample rate determined from first packet)\n",
 		loranFrequencyHz, c.iqMode)
 
-	dec, err := newPCMDecoder()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "decoder init: %v\n", err)
-		return false
-	}
-	defer dec.close()
+	// One decoder per connection. It is backward adaptive and stateful, so it
+	// must not outlive this socket: see the decoder section above.
+	dec := newPCMDecoder()
 
 	// The Loran decoder is created lazily on the first full PCM packet so
 	// that we use the actual sample rate from the packet header rather than
@@ -465,12 +395,12 @@ func (c *client) runOnce() (reconnect bool) {
 
 		switch msgType {
 		case websocket.BinaryMessage:
-			pcmBytes, rate, ch, wallMs, err := dec.decode(msg, true /* pcm-zstd */)
+			samples, rate, ch, wallMs, err := dec.decode(msg)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "decode error: %v\n", err)
 				continue
 			}
-			if len(pcmBytes) == 0 {
+			if len(samples) == 0 {
 				continue
 			}
 
@@ -506,13 +436,10 @@ func (c *client) runOnce() (reconnect bool) {
 				c.server.SetWallClockMs(wallMs)
 			}
 
-			// Convert raw bytes → []int16 (little-endian, interleaved I/Q).
-			nSamples := len(pcmBytes) / 2
-			samples := make([]int16, nSamples)
-			for i := 0; i < nSamples; i++ {
-				samples[i] = int16(binary.LittleEndian.Uint16(pcmBytes[i*2:]))
-			}
-
+			// The version 4 codec already produces int16 in the interleaved
+			// I/Q order the Loran decoder expects, so the bytes-to-samples
+			// conversion versions 1-3 needed is gone.
+			//
 			// Feed samples to the Loran-C decoder; broadcast any scope frames.
 			// TDOA/LOP updates are driven by the push loop in server.go (every 5 s),
 			// not here — calling them per-channel-frame (140×/s) was the CPU hot path.

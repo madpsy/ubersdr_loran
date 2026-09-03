@@ -36,7 +36,8 @@ CS16 IQ samples
         │
         ▼
 ubersdr_loran (Go binary)
-  ├── PCM packet decoder (zstd + full/minimal headers)
+  ├── PCM packet decoder (audio protocol v4: predictive lossless codec
+  │     + variable-length header — internal/pcmv4)
   ├── Loran-C decoder (decoder.go)
   │     ├── GRI bucket index: bn = floor(fmod(samp-offset, sampPerGRI))
   │     ├── Power: pwr = re² + im²
