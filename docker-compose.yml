@@ -20,6 +20,10 @@ services:
       #   CMA → number of GRI periods to average (default: 8, range 1–32)
       #   IIR → exponential gain factor (default: 0.2, range 0.0–1.0)
       # AVG_PARAM: "256"
+      # Reduced-depth IQ: dB the quantisation floor is held below the band
+      # noise floor (default: 26 — transparent; 0 = lossless, else 15–60).
+      # Lossless costs roughly twice the bandwidth for no visible difference.
+      # MIN_MARGIN: "26"
     networks:
       - sdr-network
     logging:

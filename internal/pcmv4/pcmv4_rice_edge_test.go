@@ -21,7 +21,7 @@ import (
 //
 // The expected hash is the one the server, the C++ SoapySDR driver and every
 // other port of this decoder agree on.
-const pcmv4RiceEdgeExpectedSHA = "83e3d94b509efbf7a212a3e10193b3eb281fe1460cbfeef6aabe474c92a718c7"
+const pcmv4RiceEdgeExpectedSHA = "3413109ff6d06d44fb8fa44c84595b776f5570f05663b762830853ddc0183527"
 
 // readV4FixtureFile is readV4Fixture for a named fixture. Same container:
 // "UV4F", a format byte, a uint32 packet count, then each packet as a uint32

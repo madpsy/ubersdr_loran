@@ -161,6 +161,7 @@ ubersdr_loran [flags]
   -pass       string   Bypass password (optional)
   -web-port   int      Port for the scope web UI (default: 8095)
   -web-static string   Path to static web files (default: ./static)
+  -min-margin int      Reduced-depth IQ margin in dB (default: 26, 0 = lossless, else 15-60)
   -no-reconnect        Disable auto-reconnect on disconnect
 ```
 

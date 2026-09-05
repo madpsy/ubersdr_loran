@@ -12,6 +12,7 @@
 //	  -web-port int      Port for the scope web UI (default: 6088)
 //	  -web-static string Path to static web files (default: ./static)
 //	  -update-hz int     Scope update rate in Hz (default: 10)
+//	  -min-margin int    Reduced-depth IQ margin in dB (default: 26, 0=lossless)
 //	  -no-reconnect      Disable auto-reconnect on disconnect
 //
 // The IQ mode ("iq" by default, giving ±5 kHz / 10 kHz sample rate) can be
@@ -55,6 +56,30 @@ const loranFrequencyHz = 100000
 const defaultWebPort = 6088
 
 const rcvBufSize = 4 * 1024 * 1024 // 4 MiB SO_RCVBUF
+
+// Reduced-depth IQ, requested with min_margin on the websocket URL.
+//
+// The margin is how far below the band's own noise floor the quantisation floor
+// is held, in dB, and the server picks the depth that honours it per packet. A
+// margin rather than a bit depth because ten bits leaves 50 dB of headroom on a
+// quiet band and 9 dB on medium wave, where one margin number means the same
+// thing everywhere -- including at 100 kHz, where the Loran-C band sits in the
+// noisiest part of the spectrum this receiver covers.
+//
+// 26 dB is the measured transparent setting the shipped UberSDR clients use:
+// the quantisation noise it adds is 0.01 dB on the total, well under what the
+// envelope detector or the TDOA correlation can see, for about half the bytes.
+// The server's own default is lossless, so a client that says nothing pays
+// roughly twice the bandwidth for a stream indistinguishable from this one.
+// Ask for 0 only if the samples are wanted bit-exact.
+//
+// Needs UberSDR 0.1.64 or later. A server that has never heard of min_margin
+// ignores it and sends the lossless stream, so an older one still works.
+const (
+	minMarginDefaultDB = 26
+	minMarginMinDB     = 15
+	minMarginMaxDB     = 60
+)
 
 // wsDialer sets SO_RCVBUF on the underlying TCP socket before the WebSocket handshake.
 var wsDialer = &websocket.Dialer{
@@ -229,6 +254,7 @@ type client struct {
 	baseURL       string
 	password      string
 	iqMode        string // IQ mode: "iq", "iq48", "iq96", "iq192", "iq384"
+	minMargin     int    // reduced-depth IQ margin in dB; 0 asks for lossless
 	sessionID     string
 	autoReconnect bool
 	running       bool
@@ -272,6 +298,14 @@ func (c *client) wsURL() string {
 	// gets version 1: the server's floor, not its current format.
 	q.Set("version", fmt.Sprintf("%d", pcmv4.ProtocolVersion))
 	q.Set("user_session_id", c.sessionID)
+	// Reduced-depth IQ, which the server sends as profile 2. It is sent unless
+	// the operator asked for lossless: an absent min_margin is not the same
+	// thing to the server as a zero one -- absent is the lossless path, and a
+	// server too old to know the parameter ignores it entirely, so omitting it
+	// is what makes lossless mean the same everywhere.
+	if c.minMargin > 0 {
+		q.Set("min_margin", fmt.Sprintf("%d", c.minMargin))
+	}
 	if c.password != "" {
 		q.Set("password", c.password)
 	}
@@ -530,11 +564,12 @@ func main() {
 		noReconn  = flag.Bool("no-reconnect", false, "Disable auto-reconnect on disconnect")
 		avgAlgo   = flag.Int("avg-algo", avgEMA, "Averaging algorithm: 0=CMA, 1=EMA (default), 2=IIR")
 		avgParam  = flag.Float64("avg-param", 256, "Averaging parameter (EMA: decay 1-512, CMA: periods 1-32, IIR: exp 0.0-1.0)")
+		minMargin = flag.Int("min-margin", minMarginDefaultDB, "Reduced-depth IQ: dB the quantisation floor is held below the band noise floor (0=lossless, else 15-60)")
 	)
 	flag.Parse()
 
 	if *rawURL == "" {
-		fmt.Fprintf(os.Stderr, "Usage: ubersdr_loran -url <http://host:port> [-pass <password>] [-mode <iq|iq48|iq96|iq192|iq384>] [-web-port <port>] [-web-static <path>] [-update-hz <hz>] [-no-reconnect]\n\n")
+		fmt.Fprintf(os.Stderr, "Usage: ubersdr_loran -url <http://host:port> [-pass <password>] [-mode <iq|iq48|iq96|iq192|iq384>] [-web-port <port>] [-web-static <path>] [-update-hz <hz>] [-min-margin <dB>] [-no-reconnect]\n\n")
 		fmt.Fprintf(os.Stderr, "  Connects to UberSDR at 100 kHz (Loran-C carrier) using the specified IQ mode\n")
 		fmt.Fprintf(os.Stderr, "  and serves a Loran-C pulse-envelope scope + TDOA/position fix at http://localhost:%d/\n", defaultWebPort)
 		os.Exit(1)
@@ -546,6 +581,16 @@ func main() {
 	}
 	if !validModes[*iqMode] {
 		fmt.Fprintf(os.Stderr, "error: invalid mode %q — must be one of: iq, iq48, iq96, iq192, iq384\n", *iqMode)
+		os.Exit(1)
+	}
+
+	// Validate the margin here rather than letting the server clamp it: it
+	// clamps silently, so an operator who asked for 5 would be given 15 with
+	// nothing said and would go on believing the stream was quantised where
+	// they put it.
+	if *minMargin != 0 && (*minMargin < minMarginMinDB || *minMargin > minMarginMaxDB) {
+		fmt.Fprintf(os.Stderr, "error: invalid -min-margin %d — must be 0 (lossless) or %d-%d dB\n",
+			*minMargin, minMarginMinDB, minMarginMaxDB)
 		os.Exit(1)
 	}
 
@@ -565,6 +610,7 @@ func main() {
 		baseURL:       *rawURL,
 		password:      *pass,
 		iqMode:        *iqMode,
+		minMargin:     *minMargin,
 		sessionID:     uuid.New().String(),
 		autoReconnect: !*noReconn,
 		running:       true,

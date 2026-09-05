@@ -9,6 +9,7 @@
 #   WEB_STATIC    Path to static web files (default: /usr/local/share/ubersdr_loran/static)
 #   AVG_ALGO      Averaging algorithm: 0=CMA, 1=EMA (default), 2=IIR
 #   AVG_PARAM     Averaging parameter (EMA: decay 1-512 default 256, CMA: periods 1-32, IIR: exp 0.0-1.0)
+#   MIN_MARGIN    Reduced-depth IQ margin in dB (default: 26, 0 = lossless, else 15-60)
 
 set -e
 
@@ -21,6 +22,7 @@ args=""
 [ -n "$UPDATE_HZ"   ] && args="$args -update-hz $UPDATE_HZ"
 [ -n "$AVG_ALGO"    ] && args="$args -avg-algo $AVG_ALGO"
 [ -n "$AVG_PARAM"   ] && args="$args -avg-param $AVG_PARAM"
+[ -n "$MIN_MARGIN"  ] && args="$args -min-margin $MIN_MARGIN"
 args="$args -web-static $WEB_STATIC"
 
 # shellcheck disable=SC2086

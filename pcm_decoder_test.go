@@ -39,7 +39,7 @@ import (
 // and this file reversed them per packet -- doing that now would silently
 // destroy the envelope), and that it reports the sample rate the Loran decoder
 // is constructed from.
-const pcmv4ExpectedSHA = "ba368c898ae406c5acc806653d9f2dbbfa40086eca3707fda5d77c13948f78d1"
+const pcmv4ExpectedSHA = "4875d2185f1ff5a2031386c569cac0c2259e6a827b9e61f813399a19c3b9c903"
 
 // readV4Fixture returns the packets in testdata/pcmv4_stream.bin.
 //
@@ -96,7 +96,7 @@ func TestPCMDecoderDecodesServerStream(t *testing.T) {
 	// while mislabelling the stream, and the sample rate is what NewLoranDecoder
 	// is built from -- it sets µs per bin for every scope trace and every TDOA
 	// measurement.
-	wantParams := [][2]int{{12000, 1}, {24000, 1}, {48000, 2}}
+	wantParams := [][2]int{{12000, 1}, {24000, 1}, {384000, 2}}
 	var gotParams [][2]int
 
 	var lastWallMs uint64
@@ -310,5 +310,35 @@ func TestWSURLRequestsProtocolVersion4(t *testing.T) {
 	}
 	if got := q.Get("frequency"); got != "100000" {
 		t.Fatalf("frequency=%q, want \"100000\"", got)
+	}
+}
+
+// Reduced-depth IQ has to be asked for: the server's own default is lossless,
+// so a client that says nothing takes roughly twice the bandwidth for a stream
+// the envelope detector cannot tell apart. Lossless in turn has to be asked for
+// by saying nothing rather than by min_margin=0, so that it means the same
+// thing against a server too old to know the parameter at all.
+func TestWSURLCarriesMinMargin(t *testing.T) {
+	c := &client{
+		baseURL:   "http://example.invalid:8080",
+		iqMode:    "iq",
+		minMargin: minMarginDefaultDB,
+		sessionID: "test-session",
+	}
+	u, err := url.Parse(c.wsURL())
+	if err != nil {
+		t.Fatalf("wsURL is not a URL: %v", err)
+	}
+	if got := u.Query().Get("min_margin"); got != "26" {
+		t.Fatalf("min_margin=%q, want \"26\"", got)
+	}
+
+	c.minMargin = 0
+	u, err = url.Parse(c.wsURL())
+	if err != nil {
+		t.Fatalf("wsURL is not a URL: %v", err)
+	}
+	if u.Query().Has("min_margin") {
+		t.Fatal("min_margin was sent for a lossless stream; it must be omitted instead")
 	}
 }

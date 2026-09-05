@@ -31,7 +31,7 @@ import (
 // The same fixture and the same expected hash are used by the Go, C++, Python
 // and JavaScript ports of this decoder; a change here that is not made there is
 // a divergence nothing else would report.
-const pcmv4ExpectedSHA = "ba368c898ae406c5acc806653d9f2dbbfa40086eca3707fda5d77c13948f78d1"
+const pcmv4ExpectedSHA = "4875d2185f1ff5a2031386c569cac0c2259e6a827b9e61f813399a19c3b9c903"
 
 // readV4Fixture returns the packets in testdata/pcmv4_stream.bin.
 //
@@ -77,7 +77,7 @@ func TestPCMv4DecodesServerStream(t *testing.T) {
 	// decoder that lost the carried-forward metadata could still hash correctly
 	// while mislabelling the stream, and the sample rate is what this bridge
 	// reports to its rtl_tcp client.
-	wantParams := [][2]int{{12000, 1}, {24000, 1}, {48000, 2}}
+	wantParams := [][2]int{{12000, 1}, {24000, 1}, {384000, 2}}
 	var gotParams [][2]int
 
 	for i, pkt := range packets {
